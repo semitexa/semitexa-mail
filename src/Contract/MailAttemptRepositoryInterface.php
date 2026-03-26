@@ -8,7 +8,10 @@ use Semitexa\Mail\Application\Db\MySQL\Model\MailAttemptResource;
 
 interface MailAttemptRepositoryInterface
 {
-    public function save(MailAttemptResource $resource): void;
+    /**
+     * @param MailAttemptResource $entity
+     */
+    public function save(object $entity): void;
 
     /**
      * @return list<MailAttemptResource>
