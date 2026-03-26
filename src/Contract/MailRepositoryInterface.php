@@ -12,5 +12,8 @@ interface MailRepositoryInterface
 
     public function findByIdempotencyKey(string $tenantId, string $idempotencyKey): ?MailMessageResource;
 
+    /**
+     * @param MailMessageResource $entity
+     */
     public function save(object $entity): void;
 }
