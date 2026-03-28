@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Semitexa\Mail\Service;
 
+use Semitexa\Core\Attributes\InjectAsReadonly;
 use Semitexa\Core\Attributes\SatisfiesServiceContract;
 use Semitexa\Core\Queue\QueueConfig;
 use Semitexa\Core\Queue\QueueTransportRegistry;
@@ -33,13 +34,20 @@ use Semitexa\Orm\Uuid\Uuid7;
 #[SatisfiesServiceContract(of: MailServiceInterface::class)]
 final class MailService implements MailServiceInterface
 {
-    public function __construct(
-        private readonly MailerConfigResolverInterface $configResolver,
-        private readonly MailTemplateRendererInterface $renderer,
-        private readonly MailRepositoryInterface $mailRepository,
-        private readonly MailAttemptRepositoryInterface $attemptRepository,
-        private readonly AttachmentResolver $attachmentResolver,
-    ) {}
+    #[InjectAsReadonly]
+    protected MailerConfigResolverInterface $configResolver;
+
+    #[InjectAsReadonly]
+    protected MailTemplateRendererInterface $renderer;
+
+    #[InjectAsReadonly]
+    protected MailRepositoryInterface $mailRepository;
+
+    #[InjectAsReadonly]
+    protected MailAttemptRepositoryInterface $attemptRepository;
+
+    #[InjectAsReadonly]
+    protected AttachmentResolver $attachmentResolver;
 
     public function send(MailEnvelope $envelope, ?MailSendOptions $options = null): MailDispatchResult
     {
