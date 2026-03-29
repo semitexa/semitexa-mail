@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace Semitexa\Mail\Service;
 
 use Semitexa\Core\Attributes\AsService;
+use Semitexa\Core\Attributes\InjectAsReadonly;
 use Semitexa\Mail\Value\AttachmentReference;
 use Semitexa\Mail\Value\ResolvedAttachment;
 use Semitexa\Storage\Contract\StorageDriverInterface;
@@ -12,9 +13,8 @@ use Semitexa\Storage\Contract\StorageDriverInterface;
 #[AsService]
 final class AttachmentResolver
 {
-    public function __construct(
-        private readonly StorageDriverInterface $storage,
-    ) {}
+    #[InjectAsReadonly]
+    protected StorageDriverInterface $storage;
 
     /**
      * @param list<AttachmentReference> $references
