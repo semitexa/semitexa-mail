@@ -1,41 +1,40 @@
 {
-    "name": "semitexa/mail",
-    "description": "Semitexa Mail \u2014 outbound email transport with SMTP, queue-safe delivery, Twig rendering, and storage-backed attachments",
-    "type": "semitexa-module",
-    "license": "MIT",
-    "authors": [
-        {
-            "name": "Semitexa",
-            "email": "support@semitexa.com"
-        }
-    ],
-    "require": {
-        "php": "^8.4",
-        "semitexa/core": "*",
-        "semitexa/orm": "*",
-        "semitexa/ssr": "*",
-        "semitexa/storage": "*"
-    },
-    "autoload": {
-        "psr-4": {
-            "Semitexa\\Mail\\": "src/"
-        }
-    },
-    "extra": {
-        "semitexa-module": {
-            "name": "mail",
-            "description": "Outbound email transport: SMTP, queue-safe delivery, Twig rendering, storage-backed attachments"
-        }
-    },
-    "version": "v0.0.3",
-    "keywords": [
-        "semitexa",
-        "mail",
-        "smtp",
-        "twig",
-        "attachments",
-        "filesystem",
-        "s3",
-        "minio"
-    ]
+  "name": "semitexa/mail",
+  "description": "Semitexa Mail — outbound email transport with SMTP, queue-safe delivery, Twig rendering, and storage-backed attachments",
+  "type": "semitexa-module",
+  "license": "MIT",
+  "authors": [
+    {
+      "name": "Semitexa",
+      "email": "support@semitexa.com"
+    }
+  ],
+  "require": {
+    "php": "^8.4",
+    "semitexa/core": "*",
+    "semitexa/orm": "*",
+    "semitexa/ssr": "*",
+    "semitexa/storage": "*"
+  },
+  "autoload": {
+    "psr-4": {
+      "Semitexa\\Mail\\": "src/"
+    }
+  },
+  "extra": {
+    "semitexa-module": {
+      "name": "mail",
+      "description": "Outbound email transport: SMTP, queue-safe delivery, Twig rendering, storage-backed attachments"
+    }
+  },
+  "keywords": [
+    "semitexa",
+    "mail",
+    "smtp",
+    "twig",
+    "attachments",
+    "filesystem",
+    "s3",
+    "minio"
+  ]
 }
