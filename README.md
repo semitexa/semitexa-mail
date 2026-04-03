@@ -1,4 +1,4 @@
-# semitexa/mail
+# Semitexa Mail
 
 Outbound email transport with SMTP, queue-safe delivery, Twig rendering, and storage-backed attachments.
 
