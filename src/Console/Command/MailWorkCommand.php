@@ -4,7 +4,7 @@ declare(strict_types=1);
 
 namespace Semitexa\Mail\Console\Command;
 
-use Semitexa\Core\Attributes\AsCommand;
+use Semitexa\Core\Attribute\AsCommand;
 use Semitexa\Core\Container\ContainerFactory;
 use Semitexa\Mail\Contract\MailAttemptRepositoryInterface;
 use Semitexa\Mail\Contract\MailRepositoryInterface;

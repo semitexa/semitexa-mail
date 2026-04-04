@@ -4,7 +4,7 @@ declare(strict_types=1);
 
 namespace Semitexa\Mail\Service;
 
-use Semitexa\Core\Attributes\SatisfiesServiceContract;
+use Semitexa\Core\Attribute\SatisfiesServiceContract;
 use Semitexa\Mail\Contract\MailerConfigResolverInterface;
 use Semitexa\Mail\Value\MailerConfig;
 

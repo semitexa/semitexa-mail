@@ -4,8 +4,8 @@ declare(strict_types=1);
 
 namespace Semitexa\Mail\Service;
 
-use Semitexa\Core\Attributes\AsService;
-use Semitexa\Core\Attributes\InjectAsReadonly;
+use Semitexa\Core\Attribute\AsService;
+use Semitexa\Core\Attribute\InjectAsReadonly;
 use Semitexa\Mail\Value\AttachmentReference;
 use Semitexa\Mail\Value\ResolvedAttachment;
 use Semitexa\Storage\Contract\StorageDriverInterface;
