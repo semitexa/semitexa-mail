@@ -4,8 +4,8 @@ declare(strict_types=1);
 
 namespace Semitexa\Mail\Service;
 
-use Semitexa\Core\Attributes\InjectAsReadonly;
-use Semitexa\Core\Attributes\SatisfiesServiceContract;
+use Semitexa\Core\Attribute\InjectAsReadonly;
+use Semitexa\Core\Attribute\SatisfiesServiceContract;
 use Semitexa\Core\Queue\QueueConfig;
 use Semitexa\Core\Queue\QueueTransportRegistry;
 use Semitexa\Mail\Application\Db\MySQL\Model\MailAttemptResource;

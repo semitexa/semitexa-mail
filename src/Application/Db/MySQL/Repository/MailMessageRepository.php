@@ -4,8 +4,8 @@ declare(strict_types=1);
 
 namespace Semitexa\Mail\Application\Db\MySQL\Repository;
 
-use Semitexa\Core\Attributes\InjectAsReadonly;
-use Semitexa\Core\Attributes\SatisfiesRepositoryContract;
+use Semitexa\Core\Attribute\InjectAsReadonly;
+use Semitexa\Core\Attribute\SatisfiesRepositoryContract;
 use Semitexa\Mail\Application\Db\MySQL\Model\MailMessageResource;
 use Semitexa\Mail\Application\Db\MySQL\Model\MailMessageTableModel;
 use Semitexa\Mail\Contract\MailRepositoryInterface;
