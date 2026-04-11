@@ -28,7 +28,7 @@ final class MailWorkCommand extends Command
             ->addArgument(
                 name:        'transport',
                 mode:        InputArgument::OPTIONAL,
-                description: 'Queue transport: rabbitmq or in-memory (default from EVENTS_ASYNC)',
+                description: 'Queue transport: nats or in-memory (default from EVENTS_ASYNC)',
                 default:     null,
             )
             ->addArgument(
