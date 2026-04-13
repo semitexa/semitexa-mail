@@ -7,7 +7,7 @@ namespace Semitexa\Mail\Application\Db\MySQL\Model;
 use Semitexa\Orm\Attribute\AsMapper;
 use Semitexa\Orm\Contract\TableModelMapper;
 
-#[AsMapper(tableModel: MailAttemptTableModel::class, domainModel: MailAttemptResource::class)]
+#[AsMapper(resourceModel: MailAttemptTableModel::class, domainModel: MailAttemptResource::class)]
 final class MailAttemptMapper implements TableModelMapper
 {
     public function toDomain(object $tableModel): object
