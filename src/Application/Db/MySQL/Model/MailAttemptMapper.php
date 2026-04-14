@@ -18,7 +18,7 @@ final class MailAttemptMapper implements ResourceModelMapperInterface
 
     public function toSourceModel(object $domainModel): object
     {
-        $domainModel instanceof MailAttemptResource || throw new \InvalidArgumentException('Unexpected resource model.');
+        $domainModel instanceof MailAttemptResource || throw new \InvalidArgumentException('Unexpected domain model.');
         return clone $domainModel;
     }
 }

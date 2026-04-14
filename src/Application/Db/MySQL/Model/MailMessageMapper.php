@@ -18,7 +18,7 @@ final class MailMessageMapper implements ResourceModelMapperInterface
 
     public function toSourceModel(object $domainModel): object
     {
-        $domainModel instanceof MailMessageResource || throw new \InvalidArgumentException('Unexpected resource model.');
+        $domainModel instanceof MailMessageResource || throw new \InvalidArgumentException('Unexpected domain model.');
         return clone $domainModel;
     }
 }
