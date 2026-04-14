@@ -7,7 +7,6 @@ namespace Semitexa\Mail\Application\Db\MySQL\Repository;
 use Semitexa\Core\Attribute\InjectAsReadonly;
 use Semitexa\Core\Attribute\SatisfiesRepositoryContract;
 use Semitexa\Mail\Application\Db\MySQL\Model\MailMessageResource;
-use Semitexa\Mail\Application\Db\MySQL\Model\MailMessageTableModel;
 use Semitexa\Mail\Contract\MailRepositoryInterface;
 use Semitexa\Orm\OrmManager;
 use Semitexa\Orm\Query\Operator;
@@ -35,8 +34,8 @@ class MailMessageRepository implements MailRepositoryInterface
     {
         /** @var MailMessageResource|null */
         return $this->repository()->query()
-            ->where(MailMessageTableModel::column('tenant_id'), Operator::Equals, $tenantId)
-            ->where(MailMessageTableModel::column('idempotency_key'), Operator::Equals, $idempotencyKey)
+            ->where(MailMessageResource::column('tenant_id'), Operator::Equals, $tenantId)
+            ->where(MailMessageResource::column('idempotency_key'), Operator::Equals, $idempotencyKey)
             ->fetchOneAs(MailMessageResource::class, $this->orm()->getMapperRegistry());
     }
 
@@ -56,7 +55,7 @@ class MailMessageRepository implements MailRepositoryInterface
     private function repository(): DomainRepository
     {
         return $this->repository ??= $this->orm()->repository(
-            MailMessageTableModel::class,
+            MailMessageResource::class,
             MailMessageResource::class,
         );
     }

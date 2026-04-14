@@ -7,7 +7,6 @@ namespace Semitexa\Mail\Application\Db\MySQL\Repository;
 use Semitexa\Core\Attribute\InjectAsReadonly;
 use Semitexa\Core\Attribute\SatisfiesRepositoryContract;
 use Semitexa\Mail\Application\Db\MySQL\Model\MailAttemptResource;
-use Semitexa\Mail\Application\Db\MySQL\Model\MailAttemptTableModel;
 use Semitexa\Mail\Contract\MailAttemptRepositoryInterface;
 use Semitexa\Orm\OrmManager;
 use Semitexa\Orm\Query\Direction;
@@ -40,8 +39,8 @@ class MailAttemptRepository implements MailAttemptRepositoryInterface
     {
         /** @var list<MailAttemptResource> */
         return $this->repository()->query()
-            ->where(MailAttemptTableModel::column('mail_message_id'), Operator::Equals, Uuid7::toBytes($messageId))
-            ->orderBy(MailAttemptTableModel::column('attempt_no'), Direction::Asc)
+            ->where(MailAttemptResource::column('mail_message_id'), Operator::Equals, Uuid7::toBytes($messageId))
+            ->orderBy(MailAttemptResource::column('attempt_no'), Direction::Asc)
             ->fetchAllAs(MailAttemptResource::class, $this->orm()->getMapperRegistry());
     }
 
@@ -58,7 +57,7 @@ class MailAttemptRepository implements MailAttemptRepositoryInterface
     private function repository(): DomainRepository
     {
         return $this->repository ??= $this->orm()->repository(
-            MailAttemptTableModel::class,
+            MailAttemptResource::class,
             MailAttemptResource::class,
         );
     }
