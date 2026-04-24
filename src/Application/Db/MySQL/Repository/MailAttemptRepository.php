@@ -18,7 +18,7 @@ use Semitexa\Orm\Uuid\Uuid7;
 class MailAttemptRepository implements MailAttemptRepositoryInterface
 {
     #[InjectAsReadonly]
-    protected ?OrmManager $orm = null;
+    protected OrmManager $orm;
 
     private ?DomainRepository $repository = null;
 

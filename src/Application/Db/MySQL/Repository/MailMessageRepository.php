@@ -16,7 +16,7 @@ use Semitexa\Orm\Repository\DomainRepository;
 class MailMessageRepository implements MailRepositoryInterface
 {
     #[InjectAsReadonly]
-    protected ?OrmManager $orm = null;
+    protected OrmManager $orm;
 
     private ?DomainRepository $repository = null;
 
