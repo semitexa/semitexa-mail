@@ -7,7 +7,7 @@ namespace Semitexa\Mail\Application\Db\MySQL\Repository;
 use Semitexa\Core\Attribute\InjectAsReadonly;
 use Semitexa\Core\Attribute\SatisfiesRepositoryContract;
 use Semitexa\Mail\Application\Db\MySQL\Model\MailAttemptResource;
-use Semitexa\Mail\Contract\MailAttemptRepositoryInterface;
+use Semitexa\Mail\Domain\Contract\MailAttemptRepositoryInterface;
 use Semitexa\Orm\OrmManager;
 use Semitexa\Orm\Query\Direction;
 use Semitexa\Orm\Query\Operator;

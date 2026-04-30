@@ -5,7 +5,7 @@ declare(strict_types=1);
 namespace Semitexa\Mail\Application\Db\MySQL\Model;
 
 use Semitexa\Orm\Attribute\AsMapper;
-use Semitexa\Orm\Contract\ResourceModelMapperInterface;
+use Semitexa\Orm\Domain\Contract\ResourceModelMapperInterface;
 
 #[AsMapper(resourceModel: MailAttemptResource::class, domainModel: MailAttemptResource::class)]
 final class MailAttemptMapper implements ResourceModelMapperInterface
