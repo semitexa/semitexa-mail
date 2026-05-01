@@ -18,7 +18,7 @@ use Semitexa\Mail\Domain\Enum\MailMessageStatus;
 use Semitexa\Mail\Domain\Model\MailRecipient;
 use Semitexa\Mail\Domain\Enum\MailTransportStatus;
 use Semitexa\Mail\Domain\Model\PreparedMailMessage;
-use Semitexa\Orm\Uuid\Uuid7;
+use Semitexa\Orm\Application\Service\Uuid7;
 use Symfony\Component\Console\Output\OutputInterface;
 
 final class MailWorker

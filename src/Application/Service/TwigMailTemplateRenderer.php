@@ -6,7 +6,7 @@ namespace Semitexa\Mail\Application\Service;
 
 use Semitexa\Core\Attribute\SatisfiesServiceContract;
 use Semitexa\Mail\Domain\Contract\MailTemplateRendererInterface;
-use Semitexa\Ssr\Template\ModuleTemplateRegistry;
+use Semitexa\Ssr\Application\Service\Template\ModuleTemplateRegistry;
 use Twig\Environment as TwigEnvironment;
 
 #[SatisfiesServiceContract(of: MailTemplateRendererInterface::class)]

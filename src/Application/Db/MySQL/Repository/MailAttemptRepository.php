@@ -12,7 +12,7 @@ use Semitexa\Orm\OrmManager;
 use Semitexa\Orm\Query\Direction;
 use Semitexa\Orm\Query\Operator;
 use Semitexa\Orm\Repository\DomainRepository;
-use Semitexa\Orm\Uuid\Uuid7;
+use Semitexa\Orm\Application\Service\Uuid7;
 
 #[SatisfiesRepositoryContract(of: MailAttemptRepositoryInterface::class)]
 class MailAttemptRepository implements MailAttemptRepositoryInterface
