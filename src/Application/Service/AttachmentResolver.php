@@ -8,7 +8,7 @@ use Semitexa\Core\Attribute\AsService;
 use Semitexa\Core\Attribute\InjectAsReadonly;
 use Semitexa\Mail\Domain\Model\AttachmentReference;
 use Semitexa\Mail\Domain\Model\ResolvedAttachment;
-use Semitexa\Storage\Domain\Contract\StorageDriverInterface;
+use Semitexa\Storage\Contract\StorageDriverInterface;
 
 #[AsService]
 final class AttachmentResolver
