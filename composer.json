@@ -1,6 +1,6 @@
 {
     "name": "semitexa/mail",
-    "description": "Semitexa Mail — outbound email transport with SMTP, queue-safe delivery, Twig rendering, and storage-backed attachments",
+    "description": "Semitexa Mail \u2014 outbound email transport with SMTP, queue-safe delivery, Twig rendering, and storage-backed attachments",
     "type": "semitexa-module",
     "license": "MIT",
     "authors": [
@@ -36,6 +36,5 @@
         "filesystem",
         "s3",
         "minio"
-    ],
-    "version": "v0.0.4"
+    ]
 }
