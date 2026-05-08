@@ -36,6 +36,5 @@
         "filesystem",
         "s3",
         "minio"
-    ],
-    "version": "v0.0.4"
+    ]
 }
