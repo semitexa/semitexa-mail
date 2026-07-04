@@ -113,36 +113,36 @@ final class MailService implements MailServiceInterface
         $fromName  = $envelope->from?->name  ?? $config->fromName;
         $replyTo   = $envelope->replyTo?->email ?? $config->replyTo;
 
-        // Persist mail message (rendered bodies stored before queue dispatch)
-        $mailMessage = new MailMessageResource();
-        $mailMessage->tenant_id      = $envelope->tenantId;
-        $mailMessage->status         = MailMessageStatus::Pending->value;
-        $mailMessage->driver         = $config->driver;
-        $mailMessage->template_handle = $envelope->templateHandle;
-        $mailMessage->from_email     = $fromEmail;
-        $mailMessage->from_name      = $fromName;
-        $mailMessage->reply_to       = $replyTo;
-        $mailMessage->to_json        = json_encode($this->recipientsToArray($envelope->to), JSON_THROW_ON_ERROR);
-        $mailMessage->cc_json        = $envelope->cc !== []
-            ? json_encode($this->recipientsToArray($envelope->cc), JSON_THROW_ON_ERROR) : null;
-        $mailMessage->bcc_json       = $envelope->bcc !== []
-            ? json_encode($this->recipientsToArray($envelope->bcc), JSON_THROW_ON_ERROR) : null;
-        $mailMessage->subject        = $subject;
-        $mailMessage->html_body      = $htmlBody;
-        $mailMessage->text_body      = $textBody;
-        $mailMessage->headers_json   = $envelope->headers !== []
-            ? json_encode($envelope->headers, JSON_THROW_ON_ERROR) : null;
-        $mailMessage->tags_json      = $envelope->tags !== []
-            ? json_encode($envelope->tags, JSON_THROW_ON_ERROR) : null;
-        $mailMessage->metadata_json  = $envelope->metadata !== []
-            ? json_encode($envelope->metadata, JSON_THROW_ON_ERROR) : null;
-        $mailMessage->attachments_json = $envelope->attachments !== []
-            ? json_encode(array_map($this->serializeAttachment(...), $envelope->attachments), JSON_THROW_ON_ERROR)
-            : null;
-        $mailMessage->idempotency_key = $envelope->idempotencyKey;
-
-        $this->mailRepository->save($mailMessage);
-        // $mailMessage->id is now set to a UUID string by ensureUuid()
+        // Persist mail message (rendered bodies stored before queue dispatch).
+        // Resources are readonly: save() returns the persisted row (with the
+        // engine-generated UUID) — always continue with the RETURNED instance.
+        $mailMessage = $this->mailRepository->save(new MailMessageResource(
+            tenant_id: $envelope->tenantId,
+            status: MailMessageStatus::Pending->value,
+            driver: $config->driver,
+            template_handle: $envelope->templateHandle,
+            from_email: $fromEmail,
+            from_name: $fromName,
+            reply_to: $replyTo,
+            to_json: json_encode($this->recipientsToArray($envelope->to), JSON_THROW_ON_ERROR),
+            cc_json: $envelope->cc !== []
+                ? json_encode($this->recipientsToArray($envelope->cc), JSON_THROW_ON_ERROR) : null,
+            bcc_json: $envelope->bcc !== []
+                ? json_encode($this->recipientsToArray($envelope->bcc), JSON_THROW_ON_ERROR) : null,
+            subject: $subject,
+            html_body: $htmlBody,
+            text_body: $textBody,
+            headers_json: $envelope->headers !== []
+                ? json_encode($envelope->headers, JSON_THROW_ON_ERROR) : null,
+            tags_json: $envelope->tags !== []
+                ? json_encode($envelope->tags, JSON_THROW_ON_ERROR) : null,
+            metadata_json: $envelope->metadata !== []
+                ? json_encode($envelope->metadata, JSON_THROW_ON_ERROR) : null,
+            attachments_json: $envelope->attachments !== []
+                ? json_encode(array_map($this->serializeAttachment(...), $envelope->attachments), JSON_THROW_ON_ERROR)
+                : null,
+            idempotency_key: $envelope->idempotencyKey,
+        ));
         $messageId = $mailMessage->id;
 
         if ($options->mode === MailSendMode::Queued) {
@@ -162,18 +162,20 @@ final class MailService implements MailServiceInterface
             $queueMessage = new QueuedMailMessage(messageId: $messageId);
             $transport->publish($queueName, $queueMessage->toJson());
 
-            $mailMessage->status = MailMessageStatus::Queued->value;
-            $this->mailRepository->save($mailMessage);
+            $this->mailRepository->save($mailMessage->copyWith([
+                'status' => MailMessageStatus::Queued->value,
+            ]));
 
             return new MailDispatchResult(
                 status:    MailDispatchStatus::Queued,
                 messageId: $messageId,
             );
         } catch (\Throwable $e) {
-            $mailMessage->status        = MailMessageStatus::EnqueueFailed->value;
-            $mailMessage->error_code    = MailErrorCode::QueueUnavailable->value;
-            $mailMessage->error_message = $e->getMessage();
-            $this->mailRepository->save($mailMessage);
+            $this->mailRepository->save($mailMessage->copyWith([
+                'status' => MailMessageStatus::EnqueueFailed->value,
+                'error_code' => MailErrorCode::QueueUnavailable->value,
+                'error_message' => $e->getMessage(),
+            ]));
 
             return new MailDispatchResult(
                 status:       MailDispatchStatus::EnqueueFailed,
@@ -193,17 +195,19 @@ final class MailService implements MailServiceInterface
         array $attachmentRefs,
         MailerConfig $config,
     ): MailDispatchResult {
-        $mailMessage->status          = MailMessageStatus::Sending->value;
-        $mailMessage->last_attempt_at = new \DateTimeImmutable();
-        $this->mailRepository->save($mailMessage);
+        $mailMessage = $this->mailRepository->save($mailMessage->copyWith([
+            'status' => MailMessageStatus::Sending->value,
+            'last_attempt_at' => new \DateTimeImmutable(),
+        ]));
 
         try {
             $resolvedAttachments = $this->attachmentResolver->resolve($attachmentRefs);
         } catch (\Throwable $e) {
-            $mailMessage->status        = MailMessageStatus::Failed->value;
-            $mailMessage->error_code    = MailErrorCode::AttachmentMissing->value;
-            $mailMessage->error_message = $e->getMessage();
-            $this->mailRepository->save($mailMessage);
+            $this->mailRepository->save($mailMessage->copyWith([
+                'status' => MailMessageStatus::Failed->value,
+                'error_code' => MailErrorCode::AttachmentMissing->value,
+                'error_message' => $e->getMessage(),
+            ]));
 
             return new MailDispatchResult(
                 status:       MailDispatchStatus::Failed,
@@ -238,21 +242,21 @@ final class MailService implements MailServiceInterface
 
         // Record attempt
         $attemptNo          = $this->attemptRepository->countByMessageId($messageId) + 1;
-        $attempt            = new MailAttemptResource();
-        $attempt->tenant_id = $mailMessage->tenant_id;
-        $attempt->mail_message_id     = Uuid7::toBytes($messageId);
-        $attempt->attempt_no          = $attemptNo;
-        $attempt->driver              = $config->driver;
-        $attempt->status              = $result->status->value;
-        $attempt->started_at          = $startedAt;
-        $attempt->finished_at         = $finishedAt;
-        $attempt->provider_message_id = $result->providerMessageId;
-        $attempt->provider_status     = $result->providerStatus;
-        $attempt->provider_response_json = $result->providerResponse !== []
-            ? json_encode($result->providerResponse, JSON_THROW_ON_ERROR) : null;
-        $attempt->error_code    = $result->errorCode;
-        $attempt->error_message = $result->errorMessage;
-        $this->attemptRepository->save($attempt);
+        $this->attemptRepository->save(new MailAttemptResource(
+            tenant_id: $mailMessage->tenant_id,
+            mail_message_id: Uuid7::toBytes($messageId),
+            attempt_no: $attemptNo,
+            driver: $config->driver,
+            status: $result->status->value,
+            started_at: $startedAt,
+            finished_at: $finishedAt,
+            provider_message_id: $result->providerMessageId,
+            provider_status: $result->providerStatus,
+            provider_response_json: $result->providerResponse !== []
+                ? json_encode($result->providerResponse, JSON_THROW_ON_ERROR) : null,
+            error_code: $result->errorCode,
+            error_message: $result->errorMessage,
+        ));
 
         // Update mail message status
         $finalStatus = match ($result->status) {
@@ -261,11 +265,12 @@ final class MailService implements MailServiceInterface
             default                       => MailMessageStatus::Failed,
         };
 
-        $mailMessage->status              = $finalStatus->value;
-        $mailMessage->provider_message_id = $result->providerMessageId;
-        $mailMessage->error_code          = $result->errorCode;
-        $mailMessage->error_message       = $result->errorMessage;
-        $this->mailRepository->save($mailMessage);
+        $this->mailRepository->save($mailMessage->copyWith([
+            'status' => $finalStatus->value,
+            'provider_message_id' => $result->providerMessageId,
+            'error_code' => $result->errorCode,
+            'error_message' => $result->errorMessage,
+        ]));
 
         if ($result->status === MailTransportStatus::Accepted) {
             return new MailDispatchResult(

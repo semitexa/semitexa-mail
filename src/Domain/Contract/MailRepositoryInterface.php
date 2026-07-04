@@ -13,7 +13,10 @@ interface MailRepositoryInterface
     public function findByIdempotencyKey(string $tenantId, string $idempotencyKey): ?MailMessageResource;
 
     /**
+     * Persist and RETURN the stored row — resources are readonly, so the
+     * write engine's generated id/state comes back on a fresh instance.
+     *
      * @param MailMessageResource $entity
      */
-    public function save(object $entity): void;
+    public function save(object $entity): MailMessageResource;
 }
