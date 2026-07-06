@@ -93,9 +93,10 @@ final class MailWorker
         }
 
         // Mark as sending
-        $mailMessage->status          = MailMessageStatus::Sending->value;
-        $mailMessage->last_attempt_at = new \DateTimeImmutable();
-        $this->mailRepository->save($mailMessage);
+        $mailMessage = $this->mailRepository->save($mailMessage->copyWith([
+            'status' => MailMessageStatus::Sending->value,
+            'last_attempt_at' => new \DateTimeImmutable(),
+        ]));
 
         try {
             $config = $this->configResolver->resolve($mailMessage->tenant_id);
@@ -148,28 +149,29 @@ final class MailWorker
 
         // Record attempt
         $attemptNo               = $this->attemptRepository->countByMessageId($message->messageId) + 1;
-        $attempt                 = new MailAttemptResource();
-        $attempt->tenant_id      = $mailMessage->tenant_id;
-        $attempt->mail_message_id = Uuid7::toBytes($message->messageId);
-        $attempt->attempt_no     = $attemptNo;
-        $attempt->driver         = $config->driver;
-        $attempt->status         = $result->status->value;
-        $attempt->started_at     = $startedAt;
-        $attempt->finished_at    = $finishedAt;
-        $attempt->provider_message_id  = $result->providerMessageId;
-        $attempt->provider_status      = $result->providerStatus;
-        $attempt->provider_response_json = $result->providerResponse !== []
-            ? json_encode($result->providerResponse, JSON_THROW_ON_ERROR) : null;
-        $attempt->error_code    = $result->errorCode;
-        $attempt->error_message = $result->errorMessage;
-        $this->attemptRepository->save($attempt);
+        $this->attemptRepository->save(new MailAttemptResource(
+            tenant_id: $mailMessage->tenant_id,
+            mail_message_id: Uuid7::toBytes($message->messageId),
+            attempt_no: $attemptNo,
+            driver: $config->driver,
+            status: $result->status->value,
+            started_at: $startedAt,
+            finished_at: $finishedAt,
+            provider_message_id: $result->providerMessageId,
+            provider_status: $result->providerStatus,
+            provider_response_json: $result->providerResponse !== []
+                ? json_encode($result->providerResponse, JSON_THROW_ON_ERROR) : null,
+            error_code: $result->errorCode,
+            error_message: $result->errorMessage,
+        ));
 
         if ($result->status === MailTransportStatus::Accepted) {
-            $mailMessage->status              = MailMessageStatus::Sent->value;
-            $mailMessage->provider_message_id = $result->providerMessageId;
-            $mailMessage->error_code          = null;
-            $mailMessage->error_message       = null;
-            $this->mailRepository->save($mailMessage);
+            $this->mailRepository->save($mailMessage->copyWith([
+                'status' => MailMessageStatus::Sent->value,
+                'provider_message_id' => $result->providerMessageId,
+                'error_code' => null,
+                'error_message' => null,
+            ]));
             $this->log("Mail '{$message->messageId}' sent (attempt {$attemptNo}).", 'success');
             return;
         }
@@ -183,17 +185,18 @@ final class MailWorker
 
         if ($isRetryable && $message->attempts < $message->maxRetries) {
             $this->requeueMessage($message, $config->queue, $result->errorCode, $result->errorMessage);
-            $mailMessage->status        = MailMessageStatus::Deferred->value;
-            $mailMessage->error_code    = $result->errorCode;
-            $mailMessage->error_message = $result->errorMessage;
-            $this->mailRepository->save($mailMessage);
+            $this->mailRepository->save($mailMessage->copyWith([
+                'status' => MailMessageStatus::Deferred->value,
+                'error_code' => $result->errorCode,
+                'error_message' => $result->errorMessage,
+            ]));
             $nextAttempt = $message->attempts + 1;
             $this->log("Mail '{$message->messageId}' deferred — retry {$nextAttempt}/{$message->maxRetries}.", 'warning');
             return;
         }
 
         // Terminal failure
-        $mailMessage->provider_message_id = $result->providerMessageId;
+        $mailMessage = $mailMessage->copyWith(['provider_message_id' => $result->providerMessageId]);
         $this->failMessage($mailMessage, $result->errorCode, $result->errorMessage);
         $this->log("Mail '{$message->messageId}' failed permanently after {$attemptNo} attempt(s): {$result->errorMessage}", 'error');
     }
@@ -203,10 +206,11 @@ final class MailWorker
         ?string $errorCode,
         ?string $errorMessage,
     ): void {
-        $mailMessage->status        = MailMessageStatus::Failed->value;
-        $mailMessage->error_code    = $errorCode;
-        $mailMessage->error_message = $errorMessage;
-        $this->mailRepository->save($mailMessage);
+        $this->mailRepository->save($mailMessage->copyWith([
+            'status' => MailMessageStatus::Failed->value,
+            'error_code' => $errorCode,
+            'error_message' => $errorMessage,
+        ]));
     }
 
     private function requeueMessage(

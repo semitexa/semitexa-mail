@@ -11,6 +11,7 @@ use Semitexa\Mail\Domain\Contract\MailAttemptRepositoryInterface;
 use Semitexa\Orm\OrmManager;
 use Semitexa\Orm\Query\Direction;
 use Semitexa\Orm\Query\Operator;
+use Semitexa\Orm\Query\SystemScopeToken;
 use Semitexa\Orm\Repository\DomainRepository;
 use Semitexa\Orm\Application\Service\Uuid7;
 
@@ -22,23 +23,34 @@ class MailAttemptRepository implements MailAttemptRepositoryInterface
 
     private ?DomainRepository $repository = null;
 
-    public function save(object $entity): void
+    private ?DomainRepository $system = null;
+
+    public function save(object $entity): MailAttemptResource
     {
         if (!$entity instanceof MailAttemptResource) {
             throw new \InvalidArgumentException(sprintf('Expected %s, got %s.', MailAttemptResource::class, $entity::class));
         }
 
-        $persisted = $entity->id === ''
-            ? $this->repository()->insert($entity)
-            : $this->repository()->update($entity);
+        /** @var MailAttemptResource */
+        return $entity->id === ''
+            ? $this->system()->insert($entity)
+            : $this->system()->update($entity);
+    }
 
-        $this->copyIntoMutableResource($persisted, $entity);
+    /**
+     * SYSTEM-scope view — deliberately cross-tenant: attempts are addressed by
+     * their message id (infrastructure), never by a tenant surface. The
+     * resource is #[TenantScoped] so future finders fail closed.
+     */
+    private function system(): DomainRepository
+    {
+        return $this->system ??= $this->repository()->withoutTenantScope(SystemScopeToken::issue());
     }
 
     public function findByMessageId(string $messageId): array
     {
         /** @var list<MailAttemptResource> */
-        return $this->repository()->query()
+        return $this->system()->query()
             ->where(MailAttemptResource::column('mail_message_id'), Operator::Equals, Uuid7::toBytes($messageId))
             ->orderBy(MailAttemptResource::column('attempt_no'), Direction::Asc)
             ->fetchAllAs(MailAttemptResource::class, $this->orm()->getMapperRegistry());
@@ -72,12 +84,4 @@ class MailAttemptRepository implements MailAttemptRepositoryInterface
         return $this->orm()->getAdapter();
     }
 
-    private function copyIntoMutableResource(object $source, MailAttemptResource $target): void
-    {
-        $source instanceof MailAttemptResource || throw new \InvalidArgumentException('Unexpected persisted resource.');
-
-        foreach (get_object_vars($source) as $property => $value) {
-            $target->{$property} = $value;
-        }
-    }
 }

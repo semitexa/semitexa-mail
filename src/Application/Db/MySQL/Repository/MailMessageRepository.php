@@ -10,6 +10,7 @@ use Semitexa\Mail\Application\Db\MySQL\Model\MailMessageResource;
 use Semitexa\Mail\Domain\Contract\MailRepositoryInterface;
 use Semitexa\Orm\OrmManager;
 use Semitexa\Orm\Query\Operator;
+use Semitexa\Orm\Query\SystemScopeToken;
 use Semitexa\Orm\Repository\DomainRepository;
 
 #[SatisfiesRepositoryContract(of: MailRepositoryInterface::class)]
@@ -20,6 +21,8 @@ class MailMessageRepository implements MailRepositoryInterface
 
     private ?DomainRepository $repository = null;
 
+    private ?DomainRepository $system = null;
+
     public function findById(int|string $id): ?MailMessageResource
     {
         if (!is_string($id)) {
@@ -27,29 +30,43 @@ class MailMessageRepository implements MailRepositoryInterface
         }
 
         /** @var MailMessageResource|null */
-        return $this->repository()->findById($id);
+        return $this->system()->findById($id);
     }
 
     public function findByIdempotencyKey(string $tenantId, string $idempotencyKey): ?MailMessageResource
     {
         /** @var MailMessageResource|null */
-        return $this->repository()->query()
-            ->where(MailMessageResource::column('tenant_id'), Operator::Equals, $tenantId)
+        return $this->repository()->forTenant($tenantId)->query()
             ->where(MailMessageResource::column('idempotency_key'), Operator::Equals, $idempotencyKey)
             ->fetchOneAs(MailMessageResource::class, $this->orm()->getMapperRegistry());
     }
 
-    public function save(object $entity): void
+    public function save(object $entity): MailMessageResource
     {
         if (!$entity instanceof MailMessageResource) {
             throw new \InvalidArgumentException(sprintf('Expected %s, got %s.', MailMessageResource::class, $entity::class));
         }
 
-        $persisted = $entity->id === ''
-            ? $this->repository()->insert($entity)
-            : $this->repository()->update($entity);
+        // First save stamps created_at; every save refreshes updated_at.
+        $now = new \DateTimeImmutable();
+        $entity = $entity->copyWith(['created_at' => $entity->created_at ?? $now, 'updated_at' => $now]);
 
-        $this->copyIntoMutableResource($persisted, $entity);
+        /** @var MailMessageResource */
+        return $entity->id === ''
+            ? $this->system()->insert($entity)
+            : $this->system()->update($entity);
+    }
+
+    /**
+     * SYSTEM-scope view — deliberately cross-tenant: the worker addresses a
+     * message by its own unique id (from the queue payload), and writes carry
+     * the tenant on the row itself. The resource is #[TenantScoped], so any
+     * FUTURE tenant-facing finder must call forTenant(...) (see
+     * findByIdempotencyKey) or copy this token-marked posture consciously.
+     */
+    private function system(): DomainRepository
+    {
+        return $this->system ??= $this->repository()->withoutTenantScope(SystemScopeToken::issue());
     }
 
     private function repository(): DomainRepository
@@ -65,12 +82,4 @@ class MailMessageRepository implements MailRepositoryInterface
         return $this->orm ??= new OrmManager();
     }
 
-    private function copyIntoMutableResource(object $source, MailMessageResource $target): void
-    {
-        $source instanceof MailMessageResource || throw new \InvalidArgumentException('Unexpected persisted resource.');
-
-        foreach (get_object_vars($source) as $property => $value) {
-            $target->{$property} = $value;
-        }
-    }
 }
