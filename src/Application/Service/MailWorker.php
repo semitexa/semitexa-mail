@@ -6,7 +6,8 @@ namespace Semitexa\Mail\Application\Service;
 
 use Semitexa\Core\Queue\QueueConfig;
 use Semitexa\Core\Queue\QueueTransportRegistry;
-use Semitexa\Mail\Application\Db\MySQL\Model\MailAttemptResource;
+use Semitexa\Mail\Domain\Model\MailAttempt;
+use Semitexa\Mail\Domain\Model\MailMessage;
 use Semitexa\Mail\Domain\Contract\MailAttemptRepositoryInterface;
 use Semitexa\Mail\Domain\Contract\MailRepositoryInterface;
 use Semitexa\Mail\Domain\Contract\MailerConfigResolverInterface;
@@ -18,7 +19,6 @@ use Semitexa\Mail\Domain\Enum\MailMessageStatus;
 use Semitexa\Mail\Domain\Model\MailRecipient;
 use Semitexa\Mail\Domain\Enum\MailTransportStatus;
 use Semitexa\Mail\Domain\Model\PreparedMailMessage;
-use Semitexa\Orm\Application\Service\Uuid7;
 use Symfony\Component\Console\Output\OutputInterface;
 
 final class MailWorker
@@ -87,19 +87,19 @@ final class MailWorker
         }
 
         // Idempotent restart safety
-        if ($mailMessage->status === MailMessageStatus::Sent->value) {
+        if ($mailMessage->getStatus() === MailMessageStatus::Sent->value) {
             $this->log("Mail message '{$message->messageId}' already sent — skipping.", 'info');
             return;
         }
 
         // Mark as sending
-        $mailMessage = $this->mailRepository->save($mailMessage->copyWith([
+        $mailMessage = $this->mailRepository->save($mailMessage->with([
             'status' => MailMessageStatus::Sending->value,
-            'last_attempt_at' => new \DateTimeImmutable(),
+            'lastAttemptAt' => new \DateTimeImmutable(),
         ]));
 
         try {
-            $config = $this->configResolver->resolve($mailMessage->tenant_id);
+            $config = $this->configResolver->resolve($mailMessage->getTenantId());
         } catch (\Throwable $e) {
             $this->failMessage($mailMessage, MailErrorCode::ConfigError->value, $e->getMessage());
             $this->log("Config error for '{$message->messageId}': {$e->getMessage()}", 'error');
@@ -108,11 +108,8 @@ final class MailWorker
 
         // Reconstruct attachment references from stored JSON
         $attachmentRefs = [];
-        if ($mailMessage->attachments_json !== null) {
-            $rawAttachments = json_decode($mailMessage->attachments_json, true) ?? [];
-            foreach ($rawAttachments as $raw) {
-                $attachmentRefs[] = $this->deserializeAttachment($raw);
-            }
+        foreach ($mailMessage->getAttachments() as $raw) {
+            $attachmentRefs[] = $this->deserializeAttachment($raw);
         }
 
         // Resolve attachment contents
@@ -124,22 +121,17 @@ final class MailWorker
             return;
         }
 
-        // Reconstruct recipients
-        $toRecipients  = $this->arrayToRecipients(json_decode($mailMessage->to_json, true) ?? []);
-        $ccRecipients  = $mailMessage->cc_json  !== null ? $this->arrayToRecipients(json_decode($mailMessage->cc_json, true))  : [];
-        $bccRecipients = $mailMessage->bcc_json !== null ? $this->arrayToRecipients(json_decode($mailMessage->bcc_json, true)) : [];
-
         $prepared              = new PreparedMailMessage();
         $prepared->messageId   = $message->messageId;
-        $prepared->from        = new MailRecipient($mailMessage->from_email, $mailMessage->from_name);
-        $prepared->replyTo     = $mailMessage->reply_to !== null ? new MailRecipient($mailMessage->reply_to) : null;
-        $prepared->to          = $toRecipients;
-        $prepared->cc          = $ccRecipients;
-        $prepared->bcc         = $bccRecipients;
-        $prepared->subject     = $mailMessage->subject;
-        $prepared->htmlBody    = $mailMessage->html_body;
-        $prepared->textBody    = $mailMessage->text_body;
-        $prepared->headers     = $mailMessage->headers_json !== null ? json_decode($mailMessage->headers_json, true) : [];
+        $prepared->from        = new MailRecipient($mailMessage->getFromEmail(), $mailMessage->getFromName());
+        $prepared->replyTo     = $mailMessage->getReplyTo() !== null ? new MailRecipient($mailMessage->getReplyTo()) : null;
+        $prepared->to          = $this->arrayToRecipients($mailMessage->getTo());
+        $prepared->cc          = $this->arrayToRecipients($mailMessage->getCc());
+        $prepared->bcc         = $this->arrayToRecipients($mailMessage->getBcc());
+        $prepared->subject     = $mailMessage->getSubject();
+        $prepared->htmlBody    = $mailMessage->getHtmlBody();
+        $prepared->textBody    = $mailMessage->getTextBody();
+        $prepared->headers     = $mailMessage->getHeaders();
         $prepared->attachments = $resolvedAttachments;
 
         $transport  = MailTransportRegistry::get($config->driver);
@@ -149,28 +141,28 @@ final class MailWorker
 
         // Record attempt
         $attemptNo               = $this->attemptRepository->countByMessageId($message->messageId) + 1;
-        $this->attemptRepository->save(new MailAttemptResource(
-            tenant_id: $mailMessage->tenant_id,
-            mail_message_id: Uuid7::toBytes($message->messageId),
-            attempt_no: $attemptNo,
+        $this->attemptRepository->save(new MailAttempt(
+            id: '',
+            tenantId: $mailMessage->getTenantId(),
+            mailMessageId: $message->messageId,
+            attemptNo: $attemptNo,
             driver: $config->driver,
             status: $result->status->value,
-            started_at: $startedAt,
-            finished_at: $finishedAt,
-            provider_message_id: $result->providerMessageId,
-            provider_status: $result->providerStatus,
-            provider_response_json: $result->providerResponse !== []
-                ? json_encode($result->providerResponse, JSON_THROW_ON_ERROR) : null,
-            error_code: $result->errorCode,
-            error_message: $result->errorMessage,
+            startedAt: $startedAt,
+            finishedAt: $finishedAt,
+            providerMessageId: $result->providerMessageId,
+            providerStatus: $result->providerStatus,
+            providerResponse: $result->providerResponse,
+            errorCode: $result->errorCode,
+            errorMessage: $result->errorMessage,
         ));
 
         if ($result->status === MailTransportStatus::Accepted) {
-            $this->mailRepository->save($mailMessage->copyWith([
+            $this->mailRepository->save($mailMessage->with([
                 'status' => MailMessageStatus::Sent->value,
-                'provider_message_id' => $result->providerMessageId,
-                'error_code' => null,
-                'error_message' => null,
+                'providerMessageId' => $result->providerMessageId,
+                'errorCode' => null,
+                'errorMessage' => null,
             ]));
             $this->log("Mail '{$message->messageId}' sent (attempt {$attemptNo}).", 'success');
             return;
@@ -185,10 +177,10 @@ final class MailWorker
 
         if ($isRetryable && $message->attempts < $message->maxRetries) {
             $this->requeueMessage($message, $config->queue, $result->errorCode, $result->errorMessage);
-            $this->mailRepository->save($mailMessage->copyWith([
+            $this->mailRepository->save($mailMessage->with([
                 'status' => MailMessageStatus::Deferred->value,
-                'error_code' => $result->errorCode,
-                'error_message' => $result->errorMessage,
+                'errorCode' => $result->errorCode,
+                'errorMessage' => $result->errorMessage,
             ]));
             $nextAttempt = $message->attempts + 1;
             $this->log("Mail '{$message->messageId}' deferred — retry {$nextAttempt}/{$message->maxRetries}.", 'warning');
@@ -196,20 +188,20 @@ final class MailWorker
         }
 
         // Terminal failure
-        $mailMessage = $mailMessage->copyWith(['provider_message_id' => $result->providerMessageId]);
+        $mailMessage = $mailMessage->with(['providerMessageId' => $result->providerMessageId]);
         $this->failMessage($mailMessage, $result->errorCode, $result->errorMessage);
         $this->log("Mail '{$message->messageId}' failed permanently after {$attemptNo} attempt(s): {$result->errorMessage}", 'error');
     }
 
     private function failMessage(
-        \Semitexa\Mail\Application\Db\MySQL\Model\MailMessageResource $mailMessage,
+        MailMessage $mailMessage,
         ?string $errorCode,
         ?string $errorMessage,
     ): void {
-        $this->mailRepository->save($mailMessage->copyWith([
+        $this->mailRepository->save($mailMessage->with([
             'status' => MailMessageStatus::Failed->value,
-            'error_code' => $errorCode,
-            'error_message' => $errorMessage,
+            'errorCode' => $errorCode,
+            'errorMessage' => $errorMessage,
         ]));
     }
 

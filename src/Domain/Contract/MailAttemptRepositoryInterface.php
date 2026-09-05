@@ -4,19 +4,19 @@ declare(strict_types=1);
 
 namespace Semitexa\Mail\Domain\Contract;
 
-use Semitexa\Mail\Application\Db\MySQL\Model\MailAttemptResource;
+use Semitexa\Mail\Domain\Model\MailAttempt;
 
 interface MailAttemptRepositoryInterface
 {
     /**
      * Persist and RETURN the stored row (see MailRepositoryInterface::save).
      *
-     * @param MailAttemptResource $entity
+     * @param MailAttempt $entity
      */
-    public function save(object $entity): MailAttemptResource;
+    public function save(MailAttempt $entity): MailAttempt;
 
     /**
-     * @return list<MailAttemptResource>
+     * @return list<MailAttempt>
      */
     public function findByMessageId(string $messageId): array;
 
