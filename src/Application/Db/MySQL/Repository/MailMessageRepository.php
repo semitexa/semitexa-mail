@@ -7,6 +7,7 @@ namespace Semitexa\Mail\Application\Db\MySQL\Repository;
 use Semitexa\Core\Attribute\InjectAsReadonly;
 use Semitexa\Core\Attribute\SatisfiesRepositoryContract;
 use Semitexa\Mail\Application\Db\MySQL\Model\MailMessageResource;
+use Semitexa\Mail\Domain\Model\MailMessage;
 use Semitexa\Mail\Domain\Contract\MailRepositoryInterface;
 use Semitexa\Orm\OrmManager;
 use Semitexa\Orm\Query\Operator;
@@ -23,36 +24,33 @@ class MailMessageRepository implements MailRepositoryInterface
 
     private ?DomainRepository $system = null;
 
-    public function findById(int|string $id): ?MailMessageResource
+    public function findById(int|string $id): ?MailMessage
     {
         if (!is_string($id)) {
             $id = (string) $id;
         }
 
-        /** @var MailMessageResource|null */
+        /** @var MailMessage|null */
         return $this->system()->findById($id);
     }
 
-    public function findByIdempotencyKey(string $tenantId, string $idempotencyKey): ?MailMessageResource
+    public function findByIdempotencyKey(string $tenantId, string $idempotencyKey): ?MailMessage
     {
-        /** @var MailMessageResource|null */
+        /** @var MailMessage|null */
         return $this->repository()->forTenant($tenantId)->query()
             ->where(MailMessageResource::column('idempotency_key'), Operator::Equals, $idempotencyKey)
-            ->fetchOneAs(MailMessageResource::class, $this->orm()->getMapperRegistry());
+            ->fetchOneAs(MailMessage::class, $this->orm()->getMapperRegistry());
     }
 
-    public function save(object $entity): MailMessageResource
+    public function save(MailMessage $entity): MailMessage
     {
-        if (!$entity instanceof MailMessageResource) {
-            throw new \InvalidArgumentException(sprintf('Expected %s, got %s.', MailMessageResource::class, $entity::class));
-        }
 
-        // First save stamps created_at; every save refreshes updated_at.
+        // First save stamps the creation time; every save refreshes the update.
         $now = new \DateTimeImmutable();
-        $entity = $entity->copyWith(['created_at' => $entity->created_at ?? $now, 'updated_at' => $now]);
+        $entity = $entity->with(['createdAt' => $entity->getCreatedAt() ?? $now, 'updatedAt' => $now]);
 
-        /** @var MailMessageResource */
-        return $entity->id === ''
+        /** @var MailMessage */
+        return $entity->getId() === ''
             ? $this->system()->insert($entity)
             : $this->system()->update($entity);
     }
@@ -73,7 +71,7 @@ class MailMessageRepository implements MailRepositoryInterface
     {
         return $this->repository ??= $this->orm()->repository(
             MailMessageResource::class,
-            MailMessageResource::class,
+            MailMessage::class,
         );
     }
 

@@ -7,6 +7,7 @@ namespace Semitexa\Mail\Application\Db\MySQL\Repository;
 use Semitexa\Core\Attribute\InjectAsReadonly;
 use Semitexa\Core\Attribute\SatisfiesRepositoryContract;
 use Semitexa\Mail\Application\Db\MySQL\Model\MailAttemptResource;
+use Semitexa\Mail\Domain\Model\MailAttempt;
 use Semitexa\Mail\Domain\Contract\MailAttemptRepositoryInterface;
 use Semitexa\Orm\OrmManager;
 use Semitexa\Orm\Query\Direction;
@@ -25,14 +26,11 @@ class MailAttemptRepository implements MailAttemptRepositoryInterface
 
     private ?DomainRepository $system = null;
 
-    public function save(object $entity): MailAttemptResource
+    public function save(MailAttempt $entity): MailAttempt
     {
-        if (!$entity instanceof MailAttemptResource) {
-            throw new \InvalidArgumentException(sprintf('Expected %s, got %s.', MailAttemptResource::class, $entity::class));
-        }
 
-        /** @var MailAttemptResource */
-        return $entity->id === ''
+        /** @var MailAttempt */
+        return $entity->getId() === ''
             ? $this->system()->insert($entity)
             : $this->system()->update($entity);
     }
@@ -49,11 +47,11 @@ class MailAttemptRepository implements MailAttemptRepositoryInterface
 
     public function findByMessageId(string $messageId): array
     {
-        /** @var list<MailAttemptResource> */
+        /** @var list<MailAttempt> */
         return $this->system()->query()
             ->where(MailAttemptResource::column('mail_message_id'), Operator::Equals, Uuid7::toBytes($messageId))
             ->orderBy(MailAttemptResource::column('attempt_no'), Direction::Asc)
-            ->fetchAllAs(MailAttemptResource::class, $this->orm()->getMapperRegistry());
+            ->fetchAllAs(MailAttempt::class, $this->orm()->getMapperRegistry());
     }
 
     public function countByMessageId(string $messageId): int
@@ -70,7 +68,7 @@ class MailAttemptRepository implements MailAttemptRepositoryInterface
     {
         return $this->repository ??= $this->orm()->repository(
             MailAttemptResource::class,
-            MailAttemptResource::class,
+            MailAttempt::class,
         );
     }
 
