@@ -29,7 +29,6 @@ use Semitexa\Mail\Domain\Model\MailSendOptions;
 use Semitexa\Mail\Domain\Enum\MailTransportStatus;
 use Semitexa\Mail\Domain\Model\MailerConfig;
 use Semitexa\Mail\Domain\Model\PreparedMailMessage;
-use Semitexa\Orm\Application\Service\Uuid7;
 
 #[SatisfiesServiceContract(of: MailServiceInterface::class)]
 final class MailService implements MailServiceInterface
@@ -234,7 +233,7 @@ final class MailService implements MailServiceInterface
         $this->attemptRepository->save(new MailAttempt(
             id: '',
             tenantId: $mailMessage->getTenantId(),
-            mailMessageId: Uuid7::toBytes($messageId),
+            mailMessageId: $messageId,
             attemptNo: $attemptNo,
             driver: $config->driver,
             status: $result->status->value,

@@ -227,9 +227,13 @@ final readonly class MailMessage
             createdAt: array_key_exists('createdAt', $changes)
                 ? ($changes['createdAt'] instanceof \DateTimeImmutable ? $changes['createdAt'] : null)
                 : $this->createdAt,
+            // A change IS the update: the row's updated_at moves unless the
+            // caller names a different instant. The resource's copyWith() did
+            // this by default, and a status change that leaves the timestamp
+            // behind makes the mail table lie about when it last moved.
             updatedAt: array_key_exists('updatedAt', $changes)
                 ? ($changes['updatedAt'] instanceof \DateTimeImmutable ? $changes['updatedAt'] : null)
-                : $this->updatedAt,
+                : new \DateTimeImmutable(),
         );
     }
 }

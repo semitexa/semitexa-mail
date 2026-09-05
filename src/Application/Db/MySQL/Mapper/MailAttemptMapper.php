@@ -6,6 +6,7 @@ namespace Semitexa\Mail\Application\Db\MySQL\Mapper;
 
 use Semitexa\Mail\Application\Db\MySQL\Model\MailAttemptResource;
 use Semitexa\Mail\Domain\Model\MailAttempt;
+use Semitexa\Orm\Application\Service\Uuid7;
 use Semitexa\Orm\Attribute\AsMapper;
 use Semitexa\Orm\Domain\Contract\ResourceModelMapperInterface;
 
@@ -32,7 +33,7 @@ final class MailAttemptMapper implements ResourceModelMapperInterface
         return new MailAttempt(
             id: $resourceModel->id,
             tenantId: $resourceModel->tenant_id,
-            mailMessageId: $resourceModel->mail_message_id,
+            mailMessageId: Uuid7::fromBytes($resourceModel->mail_message_id),
             attemptNo: $resourceModel->attempt_no,
             driver: $resourceModel->driver,
             status: $resourceModel->status,
@@ -53,7 +54,7 @@ final class MailAttemptMapper implements ResourceModelMapperInterface
         return new MailAttemptResource(
             id: $domainModel->getId(),
             tenant_id: $domainModel->getTenantId(),
-            mail_message_id: $domainModel->getMailMessageId(),
+            mail_message_id: Uuid7::toBytes($domainModel->getMailMessageId()),
             attempt_no: $domainModel->getAttemptNo(),
             driver: $domainModel->getDriver(),
             status: $domainModel->getStatus(),

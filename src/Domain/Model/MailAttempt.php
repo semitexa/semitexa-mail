@@ -20,6 +20,7 @@ final readonly class MailAttempt
     public function __construct(
         private string $id,
         private ?string $tenantId,
+        /** The canonical UUID string — the column is binary, and the mapper is where that stops. */
         private string $mailMessageId,
         private int $attemptNo,
         private string $driver,
