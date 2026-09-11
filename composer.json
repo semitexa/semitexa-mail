@@ -16,6 +16,9 @@
         "semitexa/ssr": "*",
         "semitexa/storage": "*"
     },
+    "require-dev": {
+        "phpunit/phpunit": "^10.0"
+    },
     "autoload": {
         "psr-4": {
             "Semitexa\\Mail\\": "src/"
