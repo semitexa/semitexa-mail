@@ -1,6 +1,6 @@
 {
     "name": "semitexa/mail",
-    "description": "Semitexa Mail \u2014 outbound email transport with SMTP, queue-safe delivery, Twig rendering, and storage-backed attachments",
+    "description": "Semitexa Mail — outbound email transport with SMTP, queue-safe delivery, Twig rendering, and storage-backed attachments",
     "type": "semitexa-module",
     "license": "MIT",
     "authors": [
@@ -19,6 +19,11 @@
     "autoload": {
         "psr-4": {
             "Semitexa\\Mail\\": "src/"
+        }
+    },
+    "autoload-dev": {
+        "psr-4": {
+            "Semitexa\\Mail\\Tests\\": "tests/"
         }
     },
     "extra": {

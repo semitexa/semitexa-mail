@@ -6,11 +6,22 @@ namespace Semitexa\Mail\Application\Db\MySQL\Mapper;
 
 use Semitexa\Mail\Application\Db\MySQL\Model\MailAttemptResource;
 use Semitexa\Mail\Domain\Model\MailAttempt;
-use Semitexa\Orm\Application\Service\Uuid7;
 use Semitexa\Orm\Attribute\AsMapper;
 use Semitexa\Orm\Domain\Contract\ResourceModelMapperInterface;
 
-/** The bridge between the MySQL row and one delivery attempt. */
+/**
+ * The bridge between the MySQL row and one delivery attempt.
+ *
+ * One real conversion, and it is the provider response: a JSON string in the
+ * column, an array on the attempt. `mail_message_id` is NOT one — it is a
+ * BINARY(16) column, which the ORM's TypeCaster turns into a canonical uuid
+ * string on the way out and back into 16 bytes on the way in. This mapper used
+ * to convert it a second time in both directions; the read side would have
+ * thrown «Expected 16 bytes, got 36» the first time anything read an attempt
+ * back, and the write side worked only by accident. See the scheduler's history
+ * mapper, where the same pair took the whole worker down, and
+ * `semitexa.mapperTypeConversion`, which now refuses the shape.
+ */
 #[AsMapper(resourceModel: MailAttemptResource::class, domainModel: MailAttempt::class)]
 final class MailAttemptMapper implements ResourceModelMapperInterface
 {
@@ -33,7 +44,7 @@ final class MailAttemptMapper implements ResourceModelMapperInterface
         return new MailAttempt(
             id: $resourceModel->id,
             tenantId: $resourceModel->tenant_id,
-            mailMessageId: Uuid7::fromBytes($resourceModel->mail_message_id),
+            mailMessageId: $resourceModel->mail_message_id,
             attemptNo: $resourceModel->attempt_no,
             driver: $resourceModel->driver,
             status: $resourceModel->status,
@@ -54,7 +65,7 @@ final class MailAttemptMapper implements ResourceModelMapperInterface
         return new MailAttemptResource(
             id: $domainModel->getId(),
             tenant_id: $domainModel->getTenantId(),
-            mail_message_id: Uuid7::toBytes($domainModel->getMailMessageId()),
+            mail_message_id: $domainModel->getMailMessageId(),
             attempt_no: $domainModel->getAttemptNo(),
             driver: $domainModel->getDriver(),
             status: $domainModel->getStatus(),
