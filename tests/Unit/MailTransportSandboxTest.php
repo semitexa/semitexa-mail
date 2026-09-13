@@ -8,6 +8,11 @@ use PHPUnit\Framework\Attributes\Test;
 use PHPUnit\Framework\TestCase;
 use Semitexa\Core\Lifecycle\SandboxGuard;
 use Semitexa\Mail\Application\Service\MailTransportRegistry;
+use Semitexa\Mail\Domain\Contract\MailTransportInterface;
+use Semitexa\Mail\Domain\Enum\MailTransportStatus;
+use Semitexa\Mail\Domain\Model\MailerConfig;
+use Semitexa\Mail\Domain\Model\MailTransportResult;
+use Semitexa\Mail\Domain\Model\PreparedMailMessage;
 use Semitexa\Mail\Application\Service\NullMailTransport;
 use Semitexa\Mail\Application\Service\SmtpMailTransport;
 
@@ -78,6 +83,48 @@ final class MailTransportSandboxTest extends TestCase
     {
         $this->expectException(\InvalidArgumentException::class);
         MailTransportRegistry::get('carrier-pigeon');
+    }
+
+    /**
+     * The sandbox does not trust the registry's own 'null' entry.
+     *
+     * register() is public and keys by whatever key() returns, so an
+     * application can replace the built-in no-op with a transport that really
+     * delivers. If the guard handed back the registered entry, the sandbox
+     * guarantee would be only as good as what the application registered —
+     * and a replay would send mail while reporting it as withheld.
+     */
+    #[Test]
+    public function a_replaced_null_entry_cannot_take_over_the_sandbox_no_op(): void
+    {
+        $impostor = new class () implements MailTransportInterface {
+            public bool $delivered = false;
+
+            public function key(): string
+            {
+                return 'null';
+            }
+
+            public function deliver(PreparedMailMessage $message, MailerConfig $config): MailTransportResult
+            {
+                $this->delivered = true;
+
+                return new MailTransportResult(MailTransportStatus::Accepted);
+            }
+        };
+        // AFTER boot, which is the only ordering that can actually replace the
+        // built-in entry: boot() re-registers the defaults on the first get(),
+        // so an impostor registered before it is simply overwritten and the
+        // test would pass without the fix.
+        MailTransportRegistry::get('smtp');
+        MailTransportRegistry::register($impostor);
+
+        SandboxGuard::enter('ai:trace replay');
+        $transport = MailTransportRegistry::get('smtp');
+
+        self::assertInstanceOf(NullMailTransport::class, $transport);
+        self::assertNotSame($impostor, $transport);
+        self::assertFalse($impostor->delivered);
     }
 
     /** And once the sandbox leaves, real delivery resumes. */

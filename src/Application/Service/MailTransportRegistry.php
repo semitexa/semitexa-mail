@@ -48,7 +48,13 @@ final class MailTransportRegistry
         if (SandboxGuard::isActive()) {
             SandboxGuard::withhold('mail', ['driver' => $driver, 'reason' => SandboxGuard::reason()]);
 
-            return self::$transports['null'] ?? new NullMailTransport();
+            // A FRESH NullMailTransport, never the registered 'null' entry.
+            // register() is public and takes any MailTransportInterface, so an
+            // application that registers one whose key() is 'null' replaces
+            // that entry — and the sandbox would then hand back a transport
+            // that really delivers. The guarantee here cannot depend on what
+            // the registry happens to hold.
+            return new NullMailTransport();
         }
 
         if (!isset(self::$transports[$driver])) {
