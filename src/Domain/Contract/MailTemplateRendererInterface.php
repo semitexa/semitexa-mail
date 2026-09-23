@@ -4,8 +4,6 @@ declare(strict_types=1);
 
 namespace Semitexa\Mail\Domain\Contract;
 
-use Semitexa\Mail\Domain\Model\MailEnvelope;
-
 interface MailTemplateRendererInterface
 {
     /**
