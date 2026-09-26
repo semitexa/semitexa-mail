@@ -34,7 +34,7 @@ final readonly class MailRecipient
     private static function displayName(string $name): string
     {
         if (preg_match('/[^\x20-\x7E]/', $name) === 1) {
-            return '=?UTF-8?B?' . base64_encode($name) . '?=';
+            return EncodedWord::encode($name);
         }
 
         return '"' . addcslashes($name, '"\\') . '"';

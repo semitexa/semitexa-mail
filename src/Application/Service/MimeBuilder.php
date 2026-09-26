@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Semitexa\Mail\Application\Service;
 
+use Semitexa\Mail\Domain\Model\EncodedWord;
 use Semitexa\Mail\Domain\Model\PreparedMailMessage;
 use Semitexa\Mail\Domain\Model\ResolvedAttachment;
 
@@ -45,7 +46,7 @@ final class MimeBuilder
             // A field name is printable ASCII without a colon (RFC 5322 2.2); the
             // value is encoded like the subject, so a CR/LF in it cannot start
             // a header line of its own.
-            if (preg_match('/^[\x21-\x39\x3B-\x7E]+$/', (string) $name) !== 1) {
+            if (preg_match('/^[\x21-\x39\x3B-\x7E]+\z/', (string) $name) !== 1) {
                 throw new \InvalidArgumentException(sprintf('Invalid mail header name "%s".', addcslashes((string) $name, "\0..\37")));
             }
             $lines[] = $name . ': ' . $this->encodeHeader((string) $value);
@@ -156,7 +157,7 @@ final class MimeBuilder
     private function encodeHeader(string $value): string
     {
         if (preg_match('/[^\x20-\x7E]/', $value)) {
-            return '=?UTF-8?B?' . base64_encode($value) . '?=';
+            return EncodedWord::encode($value);
         }
         return $value;
     }
