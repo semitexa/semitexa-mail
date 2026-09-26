@@ -21,7 +21,19 @@ final readonly class MailRecipient
     public function formatted(): string
     {
         if ($this->name !== null && $this->name !== '') {
-            return self::displayName($this->name) . " <{$this->email}>";
+            $display = self::displayName($this->name);
+            $address = "<{$this->email}>";
+            if (str_starts_with($display, "\r\n")) {
+                // Encoded: it starts on its own folded line (the header name
+                // and any earlier recipients are not known here), and the
+                // address moves to the next one when the last line is full.
+                $lastLine = strlen((string) strrchr("\n" . $display, "\n")) - 1;
+                if ($lastLine + 1 + strlen($address) > EncodedWord::LINE_LIMIT) {
+                    return $display . "\r\n " . $address;
+                }
+            }
+
+            return $display . ' ' . $address;
         }
         return $this->email;
     }
@@ -34,7 +46,7 @@ final readonly class MailRecipient
     private static function displayName(string $name): string
     {
         if (preg_match('/[^\x20-\x7E]/', $name) === 1) {
-            return EncodedWord::encode($name);
+            return EncodedWord::encode($name, EncodedWord::LINE_LIMIT);
         }
 
         return '"' . addcslashes($name, '"\\') . '"';

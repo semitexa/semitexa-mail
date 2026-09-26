@@ -37,7 +37,7 @@ final class MimeBuilder
             $lines[] = 'Reply-To: ' . $message->replyTo->formatted();
         }
 
-        $lines[] = 'Subject: ' . $this->encodeHeader($message->subject);
+        $lines[] = 'Subject: ' . $this->encodeHeader($message->subject, strlen('Subject: '));
         $lines[] = 'MIME-Version: 1.0';
         $lines[] = 'Date: ' . gmdate('D, d M Y H:i:s +0000');
         $lines[] = 'Message-ID: <' . $message->messageId . '>';
@@ -49,7 +49,7 @@ final class MimeBuilder
             if (preg_match('/^[\x21-\x39\x3B-\x7E]+\z/', (string) $name) !== 1) {
                 throw new \InvalidArgumentException(sprintf('Invalid mail header name "%s".', addcslashes((string) $name, "\0..\37")));
             }
-            $lines[] = $name . ': ' . $this->encodeHeader((string) $value);
+            $lines[] = $name . ': ' . $this->encodeHeader((string) $value, strlen($name) + 2);
         }
 
         return implode("\r\n", $lines);
@@ -154,10 +154,11 @@ final class MimeBuilder
         return implode(', ', array_map(fn($r) => $r->formatted(), $recipients));
     }
 
-    private function encodeHeader(string $value): string
+    /** @param int $lineUsed length of the "Name: " the value follows */
+    private function encodeHeader(string $value, int $lineUsed): string
     {
         if (preg_match('/[^\x20-\x7E]/', $value)) {
-            return EncodedWord::encode($value);
+            return EncodedWord::encode($value, $lineUsed);
         }
         return $value;
     }

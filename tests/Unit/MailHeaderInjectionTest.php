@@ -64,7 +64,7 @@ final class MailHeaderInjectionTest extends TestCase
         ] as $encoded) {
             self::assertGreaterThan(1, preg_match_all('/=\?UTF-8\?B\?[^?]*\?=/', $encoded), $encoded);
             $decoded = '';
-            foreach (preg_split('/\r\n /', explode(' <', $encoded)[0]) ?: [] as $word) {
+            foreach (preg_split('/\r\n /', explode(' <', $encoded)[0], -1, PREG_SPLIT_NO_EMPTY) ?: [] as $word) {
                 self::assertLessThanOrEqual(75, strlen($word));
                 self::assertMatchesRegularExpression('/^=\?UTF-8\?B\?[A-Za-z0-9+\/=]+\?=$/', $word);
                 $bytes = base64_decode(substr($word, 10, -2), true);
@@ -74,6 +74,41 @@ final class MailHeaderInjectionTest extends TestCase
             }
             self::assertSame($text, $decoded);
         }
+    }
+
+    #[Test]
+    public function every_header_line_holding_an_encoded_word_fits_in_76_characters(): void
+    {
+        $message = $this->message();
+        // 22 × "é" is one 72-character word: fine alone, 81 characters after "Subject: ".
+        $message->subject = str_repeat('é', 22);
+        $message->headers = ['X-A-Rather-Long-Custom-Header-Name' => str_repeat('é', 30)];
+        $message->to = [
+            new MailRecipient('first@example.com', 'Plain'),
+            new MailRecipient('a-long-mailbox-name@example.com', str_repeat('ї', 30)),
+        ];
+
+        $headers = (new MimeBuilder())->build($message)['headers'];
+
+        foreach (explode("\r\n", $headers) as $line) {
+            if (str_contains($line, '=?UTF-8?')) {
+                self::assertLessThanOrEqual(76, strlen($line), $line);
+            }
+        }
+        self::assertStringContainsString('<a-long-mailbox-name@example.com>', $headers);
+        self::assertSame(1, preg_match('/^Subject: ([^\r\n]*(?:\r\n [^\r\n]*)*)/m', $headers, $subject));
+        self::assertSame(str_repeat('é', 22), mb_decode_mimeheader($subject[1]));
+    }
+
+    #[Test]
+    public function invalid_utf8_is_not_labelled_utf8(): void
+    {
+        $encoded = EncodedWord::encode("caf\xC3 ok");
+
+        $bytes = base64_decode(substr($encoded, 10, -2), true);
+        self::assertIsString($bytes);
+        self::assertTrue(mb_check_encoding($bytes, 'UTF-8'), 'the word is labelled UTF-8, so it must decode to UTF-8');
+        self::assertStringEndsWith(' ok', $bytes);
     }
 
     #[Test]

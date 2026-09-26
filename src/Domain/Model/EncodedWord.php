@@ -7,40 +7,68 @@ namespace Semitexa\Mail\Domain\Model;
 /**
  * RFC 2047 "B" encoding for header text outside printable ASCII.
  *
- * An encoded-word may be at most 75 characters (RFC 2047 2), so a long value
- * becomes several words, split only between UTF-8 characters and folded onto
- * continuation lines. A reader joins adjacent encoded-words without the
- * folding whitespace (RFC 2047 6.2), so the decoded text is unchanged.
+ * An encoded-word may be at most 75 characters, and a header line holding one
+ * at most 76 (RFC 2047 2 and 6.2). A long value therefore becomes several
+ * words, split only between UTF-8 characters and folded onto continuation
+ * lines; the first word is sized to what is left of the line the caller has
+ * already started ("Subject: " and so on). A reader joins adjacent
+ * encoded-words without the folding whitespace, so the decoded text is unchanged.
  */
 final class EncodedWord
 {
+    /** RFC 2047 6.2: a header line containing an encoded-word. */
+    public const LINE_LIMIT = 76;
+
+    /** RFC 2047 2: one encoded-word. */
+    private const WORD_LIMIT = 75;
+
     private const PREFIX = '=?UTF-8?B?';
     private const SUFFIX = '?=';
+    private const FOLD = "\r\n ";
 
-    /** 75 - 12 wrapper characters = 63 base64 characters, i.e. at most 45 bytes. */
-    private const MAX_BYTES = 45;
-
-    public static function encode(string $text): string
+    /**
+     * @param int $lineUsed characters already on the line the first word
+     *                      continues; LINE_LIMIT starts it on a folded line
+     */
+    public static function encode(string $text, int $lineUsed = 0): string
     {
+        // The words are labelled UTF-8, so they must hold UTF-8: an invalid
+        // byte becomes U+FFFD rather than a mislabelled raw byte.
+        $text = mb_scrub($text, 'UTF-8');
         $characters = preg_split('//u', $text, -1, PREG_SPLIT_NO_EMPTY);
-        if ($characters === false) {
-            // Not valid UTF-8: there are no character boundaries to respect.
-            $characters = str_split($text);
+        if ($characters === false || $characters === []) {
+            return '';
+        }
+
+        // A continuation line is the fold's single space plus the word.
+        $continuationBudget = self::maxBytes(self::WORD_LIMIT);
+        $budget = self::maxBytes(min(self::WORD_LIMIT, self::LINE_LIMIT - $lineUsed));
+        $out = '';
+        if ($budget < strlen($characters[0])) {
+            $out = self::FOLD;
+            $budget = $continuationBudget;
         }
 
         $words = [];
         $chunk = '';
         foreach ($characters as $character) {
-            if ($chunk !== '' && strlen($chunk) + strlen($character) > self::MAX_BYTES) {
+            if ($chunk !== '' && strlen($chunk) + strlen($character) > $budget) {
                 $words[] = self::PREFIX . base64_encode($chunk) . self::SUFFIX;
                 $chunk = '';
+                $budget = $continuationBudget;
             }
             $chunk .= $character;
         }
-        if ($chunk !== '') {
-            $words[] = self::PREFIX . base64_encode($chunk) . self::SUFFIX;
-        }
+        $words[] = self::PREFIX . base64_encode($chunk) . self::SUFFIX;
 
-        return implode("\r\n ", $words);
+        return $out . implode(self::FOLD, $words);
+    }
+
+    /** Payload bytes whose encoded-word fits in $room characters. */
+    private static function maxBytes(int $room): int
+    {
+        $base64 = $room - strlen(self::PREFIX) - strlen(self::SUFFIX);
+
+        return $base64 < 4 ? 0 : intdiv($base64, 4) * 3;
     }
 }
