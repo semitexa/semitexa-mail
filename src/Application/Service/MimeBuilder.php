@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Semitexa\Mail\Application\Service;
 
+use Semitexa\Mail\Domain\Model\EncodedWord;
 use Semitexa\Mail\Domain\Model\PreparedMailMessage;
 use Semitexa\Mail\Domain\Model\ResolvedAttachment;
 
@@ -36,13 +37,19 @@ final class MimeBuilder
             $lines[] = 'Reply-To: ' . $message->replyTo->formatted();
         }
 
-        $lines[] = 'Subject: ' . $this->encodeHeader($message->subject);
+        $lines[] = 'Subject: ' . $this->encodeHeader($message->subject, strlen('Subject: '));
         $lines[] = 'MIME-Version: 1.0';
         $lines[] = 'Date: ' . gmdate('D, d M Y H:i:s +0000');
         $lines[] = 'Message-ID: <' . $message->messageId . '>';
 
         foreach ($message->headers as $name => $value) {
-            $lines[] = $name . ': ' . $value;
+            // A field name is printable ASCII without a colon (RFC 5322 2.2); the
+            // value is encoded like the subject, so a CR/LF in it cannot start
+            // a header line of its own.
+            if (preg_match('/^[\x21-\x39\x3B-\x7E]+\z/', (string) $name) !== 1) {
+                throw new \InvalidArgumentException(sprintf('Invalid mail header name "%s".', addcslashes((string) $name, "\0..\37")));
+            }
+            $lines[] = $name . ': ' . $this->encodeHeader((string) $value, strlen($name) + 2);
         }
 
         return implode("\r\n", $lines);
@@ -147,10 +154,11 @@ final class MimeBuilder
         return implode(', ', array_map(fn($r) => $r->formatted(), $recipients));
     }
 
-    private function encodeHeader(string $value): string
+    /** @param int $lineUsed length of the "Name: " the value follows */
+    private function encodeHeader(string $value, int $lineUsed): string
     {
         if (preg_match('/[^\x20-\x7E]/', $value)) {
-            return '=?UTF-8?B?' . base64_encode($value) . '?=';
+            return EncodedWord::encode($value, $lineUsed);
         }
         return $value;
     }
