@@ -42,7 +42,13 @@ final class MimeBuilder
         $lines[] = 'Message-ID: <' . $message->messageId . '>';
 
         foreach ($message->headers as $name => $value) {
-            $lines[] = $name . ': ' . $value;
+            // A field name is printable ASCII without a colon (RFC 5322 2.2); the
+            // value is encoded like the subject, so a CR/LF in it cannot start
+            // a header line of its own.
+            if (preg_match('/^[\x21-\x39\x3B-\x7E]+$/', (string) $name) !== 1) {
+                throw new \InvalidArgumentException(sprintf('Invalid mail header name "%s".', addcslashes((string) $name, "\0..\37")));
+            }
+            $lines[] = $name . ': ' . $this->encodeHeader((string) $value);
         }
 
         return implode("\r\n", $lines);
