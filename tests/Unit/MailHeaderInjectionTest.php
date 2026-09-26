@@ -99,6 +99,8 @@ final class MailHeaderInjectionTest extends TestCase
             }
         }
         self::assertStringContainsString('<a-long-mailbox-name@example.com>', $headers);
+        self::assertStringContainsString('<a@b.co>', $headers);
+        self::assertStringContainsString(str_repeat('m', 40) . '@example.com', $headers);
         self::assertSame(1, preg_match('/^Subject: ([^\r\n]*(?:\r\n [^\r\n]*)*)/m', $headers, $subject));
         self::assertSame(str_repeat('é', 22), mb_decode_mimeheader($subject[1]));
     }
