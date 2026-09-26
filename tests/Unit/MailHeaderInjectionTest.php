@@ -64,7 +64,7 @@ final class MailHeaderInjectionTest extends TestCase
         ] as $encoded) {
             self::assertGreaterThan(1, preg_match_all('/=\?UTF-8\?B\?[^?]*\?=/', $encoded), $encoded);
             $decoded = '';
-            foreach (preg_split('/\r\n /', explode(' <', $encoded)[0], -1, PREG_SPLIT_NO_EMPTY) ?: [] as $word) {
+            foreach (preg_split('/\r\n /', preg_replace('/\r\n <[^>]*>$/', '', $encoded) ?? '', -1, PREG_SPLIT_NO_EMPTY) ?: [] as $word) {
                 self::assertLessThanOrEqual(75, strlen($word));
                 self::assertMatchesRegularExpression('/^=\?UTF-8\?B\?[A-Za-z0-9+\/=]+\?=$/', $word);
                 $bytes = base64_decode(substr($word, 10, -2), true);
@@ -86,6 +86,9 @@ final class MailHeaderInjectionTest extends TestCase
         $message->to = [
             new MailRecipient('first@example.com', 'Plain'),
             new MailRecipient('a-long-mailbox-name@example.com', str_repeat('ї', 30)),
+            // A short encoded name followed by a long unfolded next recipient.
+            new MailRecipient('a@b.co', 'é'),
+            new MailRecipient(str_repeat('m', 40) . '@example.com'),
         ];
 
         $headers = (new MimeBuilder())->build($message)['headers'];
@@ -108,7 +111,7 @@ final class MailHeaderInjectionTest extends TestCase
         $bytes = base64_decode(substr($encoded, 10, -2), true);
         self::assertIsString($bytes);
         self::assertTrue(mb_check_encoding($bytes, 'UTF-8'), 'the word is labelled UTF-8, so it must decode to UTF-8');
-        self::assertStringEndsWith(' ok', $bytes);
+        self::assertSame("caf\u{FFFD} ok", $bytes, 'the invalid byte is U+FFFD, not mbstring\'s default "?"');
     }
 
     #[Test]

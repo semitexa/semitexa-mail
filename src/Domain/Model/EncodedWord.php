@@ -34,7 +34,7 @@ final class EncodedWord
     {
         // The words are labelled UTF-8, so they must hold UTF-8: an invalid
         // byte becomes U+FFFD rather than a mislabelled raw byte.
-        $text = mb_scrub($text, 'UTF-8');
+        $text = self::scrub($text);
         $characters = preg_split('//u', $text, -1, PREG_SPLIT_NO_EMPTY);
         if ($characters === false || $characters === []) {
             return '';
@@ -62,6 +62,34 @@ final class EncodedWord
         $words[] = self::PREFIX . base64_encode($chunk) . self::SUFFIX;
 
         return $out . implode(self::FOLD, $words);
+    }
+
+    /**
+     * Each invalid byte becomes U+FFFD. Not mb_scrub(): it substitutes
+     * whatever mb_substitute_character() is set to process-wide, '?' by default.
+     */
+    private static function scrub(string $text): string
+    {
+        if (mb_check_encoding($text, 'UTF-8')) {
+            return $text;
+        }
+
+        // One well-formed UTF-8 character (RFC 3629), or any other single byte.
+        preg_match_all(
+            '/[\x00-\x7F]|[\xC2-\xDF][\x80-\xBF]|\xE0[\xA0-\xBF][\x80-\xBF]|[\xE1-\xEC\xEE\xEF][\x80-\xBF]{2}'
+                . '|\xED[\x80-\x9F][\x80-\xBF]|\xF0[\x90-\xBF][\x80-\xBF]{2}|[\xF1-\xF3][\x80-\xBF]{3}'
+                . '|\xF4[\x80-\x8F][\x80-\xBF]{2}|(.)/s',
+            $text,
+            $matches,
+            PREG_SET_ORDER,
+        );
+
+        $out = '';
+        foreach ($matches as $match) {
+            $out .= isset($match[1]) ? "\u{FFFD}" : $match[0];
+        }
+
+        return $out;
     }
 
     /** Payload bytes whose encoded-word fits in $room characters. */

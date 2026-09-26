@@ -24,13 +24,11 @@ final readonly class MailRecipient
             $display = self::displayName($this->name);
             $address = "<{$this->email}>";
             if (str_starts_with($display, "\r\n")) {
-                // Encoded: it starts on its own folded line (the header name
-                // and any earlier recipients are not known here), and the
-                // address moves to the next one when the last line is full.
-                $lastLine = strlen((string) strrchr("\n" . $display, "\n")) - 1;
-                if ($lastLine + 1 + strlen($address) > EncodedWord::LINE_LIMIT) {
-                    return $display . "\r\n " . $address;
-                }
+                // Encoded: it starts on its own folded line, and so does the
+                // address. The recipient list joins entries with ", " without
+                // folding, so whatever follows must never share a line with
+                // an encoded-word (RFC 2047 6.2 caps that line at 76).
+                return $display . "\r\n " . $address;
             }
 
             return $display . ' ' . $address;
