@@ -53,13 +53,18 @@ final class TwigMailTemplateRenderer implements MailTemplateRendererInterface
         }
     }
 
+    /**
+     * A body template is optional: one that does not exist is absent. One that
+     * exists and fails is an error — catching that too sent the mail without
+     * its body and said nothing.
+     */
     private function tryRender(TwigEnvironment $twig, string $template, array $variables): ?string
     {
-        try {
-            return $twig->render($template, $variables);
-        } catch (\Throwable) {
+        if (!$twig->getLoader()->exists($template)) {
             return null;
         }
+
+        return $this->renderRequired($twig, $template, $variables);
     }
 
     private function htmlToPlainText(string $html): string
