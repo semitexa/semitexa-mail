@@ -13,10 +13,21 @@ use Twig\Environment as TwigEnvironment;
 final class TwigMailTemplateRenderer implements MailTemplateRendererInterface
 {
     /**
-     * Templates live at:
-     *   Application/View/templates/mail/<handle>.subject.txt.twig
-     *   Application/View/templates/mail/<handle>.body.html.twig
-     *   Application/View/templates/mail/<handle>.body.txt.twig  (optional, derived from HTML if absent)
+     * Templates live inside a module, under its template directory
+     * (Application/View/templates in a src/modules module):
+     *   mail/<handle>.subject.txt.twig
+     *   mail/<handle>.body.html.twig
+     *   mail/<handle>.body.txt.twig   (optional, derived from the HTML if absent)
+     *
+     * The template catalog registers a module's directory only under its
+     * namespaces (`@<alias>/...`), never in Twig's default namespace, so a
+     * handle is resolved to a namespace first:
+     *   - `@Alias/welcome` names the module explicitly: `@Alias/mail/welcome...`.
+     *   - `welcome` first tries the un-namespaced `mail/welcome...` (an app that
+     *     adds a default path keeps working), then the modules the catalog
+     *     knows, in the catalog's own order (project modules, then registered
+     *     packages — the order it resolves layouts in). The first module whose
+     *     namespace has `mail/welcome.subject.txt.twig` provides all three parts.
      *
      * @param array<string, mixed> $variables
      * @return array{subject: string, htmlBody: ?string, textBody: ?string}
@@ -24,10 +35,11 @@ final class TwigMailTemplateRenderer implements MailTemplateRendererInterface
     public function render(string $templateHandle, array $variables, ?string $locale = null): array
     {
         $twig = ModuleTemplateRegistry::getTwig();
+        $base = $this->resolveBase($twig, $templateHandle);
 
-        $subject  = $this->renderRequired($twig, "mail/{$templateHandle}.subject.txt.twig", $variables);
-        $htmlBody = $this->tryRender($twig, "mail/{$templateHandle}.body.html.twig", $variables);
-        $textBody = $this->tryRender($twig, "mail/{$templateHandle}.body.txt.twig", $variables);
+        $subject  = $this->renderRequired($twig, "{$base}.subject.txt.twig", $variables);
+        $htmlBody = $this->tryRender($twig, "{$base}.body.html.twig", $variables);
+        $textBody = $this->tryRender($twig, "{$base}.body.txt.twig", $variables);
 
         if ($textBody === null && $htmlBody !== null) {
             $textBody = $this->htmlToPlainText($htmlBody);
@@ -38,6 +50,40 @@ final class TwigMailTemplateRenderer implements MailTemplateRendererInterface
             'htmlBody' => $htmlBody !== '' ? $htmlBody : null,
             'textBody' => $textBody !== '' ? $textBody : null,
         ];
+    }
+
+    /**
+     * The template name without its `.subject.txt.twig` / `.body.*.twig` suffix,
+     * e.g. `@Shop/mail/welcome` or `mail/welcome`.
+     */
+    private function resolveBase(TwigEnvironment $twig, string $templateHandle): string
+    {
+        if (str_starts_with($templateHandle, '@') && str_contains($templateHandle, '/')) {
+            [$namespace, $handle] = explode('/', $templateHandle, 2);
+
+            return "{$namespace}/mail/{$handle}";
+        }
+
+        $loader = $twig->getLoader();
+        $plain = "mail/{$templateHandle}";
+        if ($loader->exists("{$plain}.subject.txt.twig")) {
+            return $plain;
+        }
+
+        foreach (ModuleTemplateRegistry::getModulePaths() as $module => $config) {
+            $aliases = array_values(array_unique(array_merge([(string) $module], $config['aliases'])));
+            foreach ($aliases as $alias) {
+                $candidate = "@{$alias}/{$plain}";
+                if ($loader->exists("{$candidate}.subject.txt.twig")) {
+                    return $candidate;
+                }
+            }
+        }
+
+        throw new \RuntimeException(
+            "Failed to render required mail template '{$plain}.subject.txt.twig': "
+            . "no module provides mail template '{$templateHandle}'.",
+        );
     }
 
     private function renderRequired(TwigEnvironment $twig, string $template, array $variables): string

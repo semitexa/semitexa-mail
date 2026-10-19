@@ -104,14 +104,90 @@ final class TwigMailTemplateRendererTest extends TestCase
         (new TwigMailTemplateRenderer())->render('welcome', []);
     }
 
-    /** @param array<string, string> $templates */
-    private function templates(array $templates): void
+    /**
+     * REGRESSION. The real catalog registers module templates only under
+     * namespaces (`@<alias>/...`), never in Twig's default namespace, so the
+     * un-namespaced `mail/<handle>...` the renderer asked for could not exist in
+     * production. A plain handle is now looked up in the modules the catalog knows.
+     */
+    #[Test]
+    public function a_plain_handle_is_found_in_the_module_that_provides_it(): void
+    {
+        $this->templates([
+            '@Shop/mail/welcome.subject.txt.twig' => 'Welcome, {{ name }}',
+            '@Shop/mail/welcome.body.html.twig' => '<p>Hi {{ name }}</p>',
+            '@Shop/mail/welcome.body.txt.twig' => 'Hi {{ name }}',
+        ], ['Blog' => ['Blog'], 'Shop' => ['Shop']]);
+
+        $rendered = (new TwigMailTemplateRenderer())->render('welcome', ['name' => 'Ada']);
+
+        self::assertSame(['subject' => 'Welcome, Ada', 'htmlBody' => '<p>Hi Ada</p>', 'textBody' => 'Hi Ada'], $rendered);
+    }
+
+    #[Test]
+    public function a_handle_with_a_namespace_names_its_module_explicitly(): void
+    {
+        $this->templates([
+            '@Blog/mail/welcome.subject.txt.twig' => 'From Blog',
+            '@Shop/mail/welcome.subject.txt.twig' => 'From Shop',
+            '@Shop/mail/welcome.body.html.twig' => '<p>Shop body</p>',
+        ], ['Blog' => ['Blog'], 'Shop' => ['Shop']]);
+
+        $rendered = (new TwigMailTemplateRenderer())->render('@Shop/welcome', []);
+
+        self::assertSame('From Shop', $rendered['subject']);
+        self::assertSame('<p>Shop body</p>', $rendered['htmlBody']);
+    }
+
+    /**
+     * Two modules ship the same handle: the first in the catalog's module order
+     * wins — the order the catalog itself resolves layouts in (project modules
+     * under src/modules first, then registered packages), so a project module
+     * overrides a package. All three parts come from that one module: the second
+     * module's body is never mixed in.
+     */
+    #[Test]
+    public function when_two_modules_provide_a_handle_the_first_in_catalog_order_wins(): void
+    {
+        $this->templates([
+            '@Shop/mail/welcome.subject.txt.twig' => 'From Shop',
+            '@Blog/mail/welcome.subject.txt.twig' => 'From Blog',
+            '@Blog/mail/welcome.body.html.twig' => '<p>Blog body</p>',
+        ], ['Shop' => ['Shop'], 'Blog' => ['Blog']]);
+
+        $rendered = (new TwigMailTemplateRenderer())->render('welcome', []);
+
+        self::assertSame('From Shop', $rendered['subject']);
+        self::assertNull($rendered['htmlBody']);
+    }
+
+    #[Test]
+    public function a_handle_no_module_provides_is_an_error_that_names_the_handle(): void
+    {
+        $this->templates([
+            '@Shop/mail/receipt.subject.txt.twig' => 'Receipt',
+        ], ['Shop' => ['Shop']]);
+
+        $this->expectException(\RuntimeException::class);
+        $this->expectExceptionMessage("no module provides mail template 'welcome'");
+
+        (new TwigMailTemplateRenderer())->render('welcome', []);
+    }
+
+    /** @param array<string, string> $templates
+     *  @param array<string, list<string>> $modules module name => aliases, in catalog order */
+    private function templates(array $templates, array $modules = []): void
     {
         $loader = new ArrayLoader($templates);
         $catalog = new ModuleTemplateCatalog();
         $reflection = new \ReflectionClass($catalog);
         $reflection->getProperty('twig')->setValue($catalog, new TwigEnvironment($loader, ['cache' => false, 'autoescape' => 'html']));
         $reflection->getProperty('loader')->setValue($catalog, $loader);
+        $modulePaths = [];
+        foreach ($modules as $name => $aliases) {
+            $modulePaths[$name] = ['aliases' => $aliases, 'path' => '/nonexistent/' . $name, 'type' => 'standard'];
+        }
+        $reflection->getProperty('modulePaths')->setValue($catalog, $modulePaths);
         $reflection->getProperty('initialized')->setValue($catalog, true);
         ModuleTemplateRegistry::setCatalog($catalog);
     }
