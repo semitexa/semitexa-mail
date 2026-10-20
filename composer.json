@@ -12,6 +12,7 @@
     "require": {
         "php": "^8.4",
         "semitexa/core": ">=2026.09.13.1915 || dev-master",
+        "semitexa/locale": "*",
         "semitexa/orm": "*",
         "semitexa/ssr": "*",
         "semitexa/storage": "*"
