@@ -47,6 +47,8 @@ final class MailServiceTest extends TestCase
 
     private FakeMailTransport $fake;
 
+    private string|false $eventsAsync = false;
+
     protected function setUp(): void
     {
         MailTransportRegistry::reset();
@@ -56,6 +58,7 @@ final class MailServiceTest extends TestCase
         $this->attempts = new MailServiceAttempts();
         QueueTransportRegistry::reset();
         MailServiceQueueSpy::$published = [];
+        $this->eventsAsync = getenv('EVENTS_ASYNC');
     }
 
     protected function tearDown(): void
@@ -63,6 +66,7 @@ final class MailServiceTest extends TestCase
         MailTransportRegistry::reset();
         QueueTransportRegistry::reset();
         putenv('EVENTS_TRANSPORT');
+        putenv($this->eventsAsync === false ? 'EVENTS_ASYNC' : 'EVENTS_ASYNC=' . $this->eventsAsync);
     }
 
     #[Test]
@@ -122,6 +126,26 @@ final class MailServiceTest extends TestCase
         self::assertSame('mail', MailServiceQueueSpy::$published[0][0]);
         self::assertStringContainsString((string) $result->messageId, MailServiceQueueSpy::$published[0][1]);
         self::assertSame('queued', $this->messages->byId($result->messageId)?->getStatus());
+    }
+
+    /**
+     * REGRESSION (tk-queued-mail-sync-without-async). With EVENTS_ASYNC=0 the
+     * queue is in-memory, one per process, and no mail:work can read it: a
+     * queued mail was marked queued and never sent. Without async events it
+     * is sent at once, and the result says sent.
+     */
+    #[Test]
+    public function without_async_events_a_queued_send_is_delivered_at_once(): void
+    {
+        putenv('EVENTS_ASYNC=0');
+        putenv('EVENTS_TRANSPORT');
+
+        $result = $this->service()->send($this->envelope(subject: 'Later', text: 'Hello now'), new MailSendOptions(mode: MailSendMode::Queued));
+
+        self::assertSame(MailDispatchStatus::Sent, $result->status);
+        self::assertSame(1, $this->fake->count());
+        self::assertSame('Hello now', $this->fake->getLastMessage()?->textBody);
+        self::assertSame('sent', $this->messages->byId($result->messageId)?->getStatus());
     }
 
     #[Test]

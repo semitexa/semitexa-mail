@@ -33,6 +33,11 @@
         "semitexa-module": {
             "name": "mail",
             "description": "Outbound email transport: SMTP, queue-safe delivery, Twig rendering, storage-backed attachments"
+        },
+        "semitexa": {
+            "floors": {
+                "semitexa/core": "next"
+            }
         }
     },
     "keywords": [

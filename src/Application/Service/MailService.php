@@ -138,11 +138,25 @@ final class MailService implements MailServiceInterface
         ));
         $messageId = $mailMessage->getId();
 
-        if ($options->mode === MailSendMode::Queued) {
+        if ($options->mode === MailSendMode::Queued && !$this->queueIsProcessLocal()) {
             return $this->dispatchToQueue($mailMessage, $messageId, $config->queue);
         }
 
         return $this->sendSync($mailMessage, $messageId, $envelope->attachments, $config);
+    }
+
+    /**
+     * Without async events the queue is in-memory, one per process, and no
+     * mail:work can read it: a queued mail is sent at once instead. A transport
+     * that cannot be resolved is left to dispatchToQueue(), which reports it.
+     */
+    private function queueIsProcessLocal(): bool
+    {
+        try {
+            return QueueConfig::isProcessLocal(QueueConfig::defaultTransport());
+        } catch (\Throwable) {
+            return false;
+        }
     }
 
     private function dispatchToQueue(
