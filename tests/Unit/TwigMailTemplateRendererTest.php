@@ -6,11 +6,18 @@ namespace Semitexa\Mail\Tests\Unit;
 
 use PHPUnit\Framework\Attributes\Test;
 use PHPUnit\Framework\TestCase;
+use Semitexa\Locale\Application\Service\I18n\TranslationCatalog;
+use Semitexa\Locale\Application\Service\I18n\TranslationService;
+use Semitexa\Locale\Context\LocaleContextStore;
+use Semitexa\Locale\Context\LocaleManager;
 use Semitexa\Mail\Application\Service\TwigMailTemplateRenderer;
+use Semitexa\Ssr\Application\Service\Extension\LocaleTwigExtension;
+use Semitexa\Ssr\Application\Service\I18n\Translator;
 use Semitexa\Ssr\Application\Service\Template\ModuleTemplateCatalog;
 use Semitexa\Ssr\Application\Service\Template\ModuleTemplateRegistry;
 use Twig\Environment as TwigEnvironment;
 use Twig\Loader\ArrayLoader;
+use Twig\TwigFunction;
 
 /**
  * Mail templates — <handle>.subject.txt.twig, .body.html.twig and an optional
@@ -31,6 +38,76 @@ final class TwigMailTemplateRendererTest extends TestCase
     protected function tearDown(): void
     {
         (new \ReflectionProperty(ModuleTemplateRegistry::class, 'catalog'))->setValue(null, $this->previous);
+        Translator::reset();
+        LocaleContextStore::setLocale('en');
+    }
+
+    /**
+     * REGRESSION (tk-mail-renderer-locale). The locale a mail is sent in was
+     * passed to the renderer and ignored: every mail was rendered in the
+     * locale of whoever sent it (the visitor's request, or the worker's
+     * default), so a Ukrainian customer got the receipt in the language of
+     * the admin who pressed the button. The mail now renders in its own
+     * locale, and the sender's locale is put back after it.
+     */
+    #[Test]
+    public function a_mail_is_rendered_in_the_locale_it_is_given_and_the_senders_locale_is_kept(): void
+    {
+        $this->translations([
+            'en' => ['mail.welcome' => 'Welcome, {{name}}'],
+            'uk' => ['mail.welcome' => 'Вітаємо, {{name}}'],
+            'de' => ['mail.welcome' => 'Willkommen, {{name}}'],
+        ]);
+        $this->templates([
+            'mail/welcome.subject.txt.twig' => "{{ trans('mail.welcome', {name: name}) }}",
+            'mail/welcome.body.html.twig' => '<p lang="{{ locale() }}">{{ trans(\'mail.welcome\', {name: name}) }}</p>',
+        ]);
+        LocaleContextStore::setLocale('en');
+        $renderer = $this->renderer();
+
+        $uk = $renderer->render('welcome', ['name' => 'Ada'], 'uk');
+        $de = $renderer->render('welcome', ['name' => 'Ada'], 'de');
+        $sendersOwn = $renderer->render('welcome', ['name' => 'Ada']);
+
+        self::assertSame(['subject' => 'Вітаємо, Ada', 'htmlBody' => '<p lang="uk">Вітаємо, Ada</p>'], ['subject' => $uk['subject'], 'htmlBody' => $uk['htmlBody']]);
+        self::assertSame(['subject' => 'Willkommen, Ada', 'htmlBody' => '<p lang="de">Willkommen, Ada</p>'], ['subject' => $de['subject'], 'htmlBody' => $de['htmlBody']]);
+        self::assertSame('Welcome, Ada', $sendersOwn['subject'], 'no locale: the sender\'s');
+        self::assertSame('en', LocaleContextStore::getLocale(), 'the sender\'s locale is put back');
+    }
+
+    /** A template that fails still puts the sender's locale back. */
+    #[Test]
+    public function the_senders_locale_is_put_back_when_rendering_fails(): void
+    {
+        $this->templates(['mail/welcome.subject.txt.twig' => '{{ missing() }}']);
+        LocaleContextStore::setLocale('en');
+
+        try {
+            $this->renderer()->render('welcome', [], 'uk');
+            self::fail('the broken template rendered');
+        } catch (\RuntimeException) {
+        }
+
+        self::assertSame('en', LocaleContextStore::getLocale());
+    }
+
+    private function renderer(): TwigMailTemplateRenderer
+    {
+        $renderer = new TwigMailTemplateRenderer();
+        // What the container injects.
+        (new \ReflectionProperty($renderer, 'localeContext'))->setValue($renderer, new LocaleManager());
+
+        return $renderer;
+    }
+
+    /** @param array<string, array<string, string>> $byLocale */
+    private function translations(array $byLocale): void
+    {
+        $catalog = new TranslationCatalog();
+        foreach ($byLocale as $locale => $messages) {
+            $catalog->addMessages($locale, 'Mail', $messages);
+        }
+        Translator::setService(new TranslationService($catalog, LocaleManager::getInstance()));
     }
 
     #[Test]
@@ -181,7 +258,12 @@ final class TwigMailTemplateRendererTest extends TestCase
         $loader = new ArrayLoader($templates);
         $catalog = new ModuleTemplateCatalog();
         $reflection = new \ReflectionClass($catalog);
-        $reflection->getProperty('twig')->setValue($catalog, new TwigEnvironment($loader, ['cache' => false, 'autoescape' => 'html']));
+        $twig = new TwigEnvironment($loader, ['cache' => false, 'autoescape' => 'html']);
+        // The framework's own trans() and locale(), as the catalog registers them.
+        $locale = new LocaleTwigExtension();
+        $twig->addFunction(new TwigFunction('trans', $locale->translate(...)));
+        $twig->addFunction(new TwigFunction('locale', $locale->currentLocale(...)));
+        $reflection->getProperty('twig')->setValue($catalog, $twig);
         $reflection->getProperty('loader')->setValue($catalog, $loader);
         $modulePaths = [];
         foreach ($modules as $name => $aliases) {

@@ -4,7 +4,9 @@ declare(strict_types=1);
 
 namespace Semitexa\Mail\Application\Service;
 
+use Semitexa\Core\Attribute\InjectAsReadonly;
 use Semitexa\Core\Attribute\SatisfiesServiceContract;
+use Semitexa\Core\Locale\LocaleContextInterface;
 use Semitexa\Mail\Domain\Contract\MailTemplateRendererInterface;
 use Semitexa\Ssr\Application\Service\Template\ModuleTemplateRegistry;
 use Twig\Environment as TwigEnvironment;
@@ -12,6 +14,9 @@ use Twig\Environment as TwigEnvironment;
 #[SatisfiesServiceContract(of: MailTemplateRendererInterface::class)]
 final class TwigMailTemplateRenderer implements MailTemplateRendererInterface
 {
+    #[InjectAsReadonly]
+    protected LocaleContextInterface $localeContext;
+
     /**
      * Templates live inside a module, under its template directory
      * (Application/View/templates in a src/modules module):
@@ -29,10 +34,35 @@ final class TwigMailTemplateRenderer implements MailTemplateRendererInterface
      *     packages — the order it resolves layouts in). The first module whose
      *     namespace has `mail/welcome.subject.txt.twig` provides all three parts.
      *
+     * A mail is rendered in its own locale: trans() and locale() in its
+     * templates answer for `$locale`, not for the request or job that sends
+     * it. The sender's locale is put back afterwards, whatever happens: the
+     * rest of that request still renders in it. Without a locale, the
+     * sender's is used.
+     *
      * @param array<string, mixed> $variables
      * @return array{subject: string, htmlBody: ?string, textBody: ?string}
      */
     public function render(string $templateHandle, array $variables, ?string $locale = null): array
+    {
+        if ($locale === null || $locale === '') {
+            return $this->renderParts($templateHandle, $variables);
+        }
+
+        $sendersLocale = $this->localeContext->getLocale();
+        $this->localeContext->setLocale($locale);
+        try {
+            return $this->renderParts($templateHandle, $variables);
+        } finally {
+            $this->localeContext->setLocale($sendersLocale);
+        }
+    }
+
+    /**
+     * @param array<string, mixed> $variables
+     * @return array{subject: string, htmlBody: ?string, textBody: ?string}
+     */
+    private function renderParts(string $templateHandle, array $variables): array
     {
         $twig = ModuleTemplateRegistry::getTwig();
         $base = $this->resolveBase($twig, $templateHandle);
