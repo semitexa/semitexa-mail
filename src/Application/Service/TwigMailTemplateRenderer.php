@@ -7,6 +7,8 @@ namespace Semitexa\Mail\Application\Service;
 use Semitexa\Core\Attribute\InjectAsReadonly;
 use Semitexa\Core\Attribute\SatisfiesServiceContract;
 use Semitexa\Core\Locale\LocaleContextInterface;
+use Semitexa\Locale\Configuration\LocaleConfig;
+use Semitexa\Locale\Context\LocaleContextStore;
 use Semitexa\Mail\Domain\Contract\MailTemplateRendererInterface;
 use Semitexa\Ssr\Application\Service\Template\ModuleTemplateRegistry;
 use Twig\Environment as TwigEnvironment;
@@ -45,17 +47,42 @@ final class TwigMailTemplateRenderer implements MailTemplateRendererInterface
      */
     public function render(string $templateHandle, array $variables, ?string $locale = null): array
     {
-        if ($locale === null || $locale === '') {
+        if ($locale === null || trim($locale) === '') {
             return $this->renderParts($templateHandle, $variables);
         }
 
         $sendersLocale = $this->localeContext->getLocale();
-        $this->localeContext->setLocale($locale);
+        $this->localeContext->setLocale($this->supportedLocale($locale));
         try {
             return $this->renderParts($templateHandle, $variables);
         } finally {
             $this->localeContext->setLocale($sendersLocale);
         }
+    }
+
+    /**
+     * The locale as the site has it. An envelope may carry uk-UA, uk_UA or
+     * UK; like the Accept-Language resolver, the full tag is taken when the
+     * site supports it, else its primary subtag when that is supported, else
+     * the tag as given (the catalog then falls back on its own).
+     */
+    private function supportedLocale(string $locale): string
+    {
+        $parts = explode('-', str_replace('_', '-', strtolower(trim($locale))), 2);
+        $primary = $parts[0];
+        $tag = isset($parts[1]) ? $primary . '-' . strtoupper($parts[1]) : $primary;
+
+        // Per tenant, resolved for this request; the configured set before that.
+        $supported = LocaleContextStore::getSupportedLocales();
+        if ($supported === []) {
+            $supported = LocaleConfig::fromEnvironment()->supportedLocales;
+        }
+
+        if (in_array($tag, $supported, true) || !in_array($primary, $supported, true)) {
+            return $tag;
+        }
+
+        return $primary;
     }
 
     /**

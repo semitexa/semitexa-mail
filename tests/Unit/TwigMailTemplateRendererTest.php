@@ -40,6 +40,7 @@ final class TwigMailTemplateRendererTest extends TestCase
         (new \ReflectionProperty(ModuleTemplateRegistry::class, 'catalog'))->setValue(null, $this->previous);
         Translator::reset();
         LocaleContextStore::setLocale('en');
+        LocaleContextStore::setSupportedLocales([]);
     }
 
     /**
@@ -57,12 +58,12 @@ final class TwigMailTemplateRendererTest extends TestCase
             'en' => ['mail.welcome' => 'Welcome, {{name}}'],
             'uk' => ['mail.welcome' => 'Вітаємо, {{name}}'],
             'de' => ['mail.welcome' => 'Willkommen, {{name}}'],
+            'fr' => ['mail.welcome' => 'Bienvenue, {{name}}'],
         ]);
-        $this->templates([
-            'mail/welcome.subject.txt.twig' => "{{ trans('mail.welcome', {name: name}) }}",
-            'mail/welcome.body.html.twig' => '<p lang="{{ locale() }}">{{ trans(\'mail.welcome\', {name: name}) }}</p>',
-        ]);
-        LocaleContextStore::setLocale('en');
+        $this->welcomeTemplates();
+        // The sender's own locale is not the default, so putting back the
+        // default instead of the sender's would show.
+        LocaleContextStore::setLocale('fr');
         $renderer = $this->renderer();
 
         $uk = $renderer->render('welcome', ['name' => 'Ada'], 'uk');
@@ -71,8 +72,50 @@ final class TwigMailTemplateRendererTest extends TestCase
 
         self::assertSame(['subject' => 'Вітаємо, Ada', 'htmlBody' => '<p lang="uk">Вітаємо, Ada</p>'], ['subject' => $uk['subject'], 'htmlBody' => $uk['htmlBody']]);
         self::assertSame(['subject' => 'Willkommen, Ada', 'htmlBody' => '<p lang="de">Willkommen, Ada</p>'], ['subject' => $de['subject'], 'htmlBody' => $de['htmlBody']]);
-        self::assertSame('Welcome, Ada', $sendersOwn['subject'], 'no locale: the sender\'s');
-        self::assertSame('en', LocaleContextStore::getLocale(), 'the sender\'s locale is put back');
+        self::assertSame('Bienvenue, Ada', $sendersOwn['subject'], 'no locale: the sender\'s');
+        self::assertSame('fr', LocaleContextStore::getLocale(), 'the sender\'s locale is put back');
+    }
+
+    /**
+     * An envelope locale is written as a person or a database has it: uk-UA,
+     * uk_UA, UK. Like the Accept-Language resolver, the renderer takes the
+     * language a site supports: the full tag when it is supported, else its
+     * primary subtag when that is.
+     */
+    #[Test]
+    public function a_regional_or_differently_written_locale_renders_in_the_supported_language(): void
+    {
+        $this->translations([
+            'en' => ['mail.welcome' => 'Welcome, {{name}}'],
+            'uk' => ['mail.welcome' => 'Вітаємо, {{name}}'],
+        ]);
+        $this->welcomeTemplates();
+        LocaleContextStore::setSupportedLocales(['en', 'uk']);
+        $renderer = $this->renderer();
+
+        foreach (['uk-UA', 'uk_UA', 'UK', ' uk-ua '] as $given) {
+            self::assertSame('<p lang="uk">Вітаємо, Ada</p>', $renderer->render('welcome', ['name' => 'Ada'], $given)['htmlBody'], $given);
+        }
+    }
+
+    /** A regional tag the site supports is kept whole; a primary subtag it does not support is not taken. */
+    #[Test]
+    public function the_primary_subtag_is_taken_only_when_the_full_tag_is_not_supported_and_it_is(): void
+    {
+        $this->translations([
+            'en' => ['mail.welcome' => 'Welcome, {{name}}'],
+            'pt' => ['mail.welcome' => 'Bem-vindo, {{name}}'],
+            'pt-BR' => ['mail.welcome' => 'Bem-vinda, {{name}}'],
+        ]);
+        $this->welcomeTemplates();
+        LocaleContextStore::setSupportedLocales(['en', 'pt', 'pt-BR']);
+        $renderer = $this->renderer();
+
+        self::assertSame('<p lang="pt-BR">Bem-vinda, Ada</p>', $renderer->render('welcome', ['name' => 'Ada'], 'pt_br')['htmlBody']);
+        self::assertSame('<p lang="pt">Bem-vindo, Ada</p>', $renderer->render('welcome', ['name' => 'Ada'], 'pt-PT')['htmlBody']);
+
+        LocaleContextStore::setSupportedLocales(['en']);
+        self::assertSame('<p lang="pt-PT">Welcome, Ada</p>', $renderer->render('welcome', ['name' => 'Ada'], 'pt-PT')['htmlBody'], 'unsupported: as given, normalised, and the catalog\'s fallback');
     }
 
     /** A template that fails still puts the sender's locale back. */
@@ -80,7 +123,7 @@ final class TwigMailTemplateRendererTest extends TestCase
     public function the_senders_locale_is_put_back_when_rendering_fails(): void
     {
         $this->templates(['mail/welcome.subject.txt.twig' => '{{ missing() }}']);
-        LocaleContextStore::setLocale('en');
+        LocaleContextStore::setLocale('fr');
 
         try {
             $this->renderer()->render('welcome', [], 'uk');
@@ -88,7 +131,15 @@ final class TwigMailTemplateRendererTest extends TestCase
         } catch (\RuntimeException) {
         }
 
-        self::assertSame('en', LocaleContextStore::getLocale());
+        self::assertSame('fr', LocaleContextStore::getLocale());
+    }
+
+    private function welcomeTemplates(): void
+    {
+        $this->templates([
+            'mail/welcome.subject.txt.twig' => "{{ trans('mail.welcome', {name: name}) }}",
+            'mail/welcome.body.html.twig' => '<p lang="{{ locale() }}">{{ trans(\'mail.welcome\', {name: name}) }}</p>',
+        ]);
     }
 
     private function renderer(): TwigMailTemplateRenderer
