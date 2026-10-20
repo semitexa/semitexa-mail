@@ -29,18 +29,33 @@ final class TwigMailTemplateRendererTest extends TestCase
 {
     private ?ModuleTemplateCatalog $previous = null;
 
+    /** @var array<string, mixed> Translator's static state as found, unset service included */
+    private array $translator = [];
+
+    private string $locale = 'en';
+
+    /** @var list<string> */
+    private array $supported = [];
+
     protected function setUp(): void
     {
         $previous = (new \ReflectionProperty(ModuleTemplateRegistry::class, 'catalog'))->getValue();
         $this->previous = $previous instanceof ModuleTemplateCatalog ? $previous : null;
+        // By reflection: getService() would build a service that was not there.
+        $this->translator = (new \ReflectionClass(Translator::class))->getStaticProperties();
+        $this->locale = LocaleContextStore::getLocale();
+        $this->supported = array_values(LocaleContextStore::getSupportedLocales());
     }
 
     protected function tearDown(): void
     {
         (new \ReflectionProperty(ModuleTemplateRegistry::class, 'catalog'))->setValue(null, $this->previous);
-        Translator::reset();
-        LocaleContextStore::setLocale('en');
-        LocaleContextStore::setSupportedLocales([]);
+        $translator = new \ReflectionClass(Translator::class);
+        foreach ($this->translator as $name => $value) {
+            $translator->setStaticPropertyValue($name, $value);
+        }
+        LocaleContextStore::setLocale($this->locale);
+        LocaleContextStore::setSupportedLocales($this->supported);
     }
 
     /**
@@ -96,6 +111,23 @@ final class TwigMailTemplateRendererTest extends TestCase
         foreach (['uk-UA', 'uk_UA', 'UK', ' uk-ua '] as $given) {
             self::assertSame('<p lang="uk">Вітаємо, Ada</p>', $renderer->render('welcome', ['name' => 'Ada'], $given)['htmlBody'], $given);
         }
+    }
+
+    /** zh-Hant is not zh-HANT, and a site that wrote pt-br wants pt-br: matched in any case, answered as the site spells it (review). */
+    #[Test]
+    public function a_supported_locale_is_matched_in_any_case_and_answered_as_the_site_spells_it(): void
+    {
+        $this->translations([
+            'en' => ['mail.welcome' => 'Welcome, {{name}}'],
+            'zh-Hant' => ['mail.welcome' => '歡迎, {{name}}'],
+            'pt-br' => ['mail.welcome' => 'Bem-vinda, {{name}}'],
+        ]);
+        $this->welcomeTemplates();
+        LocaleContextStore::setSupportedLocales(['en', 'zh-Hant', 'pt-br']);
+        $renderer = $this->renderer();
+
+        self::assertSame('<p lang="zh-Hant">歡迎, Ada</p>', $renderer->render('welcome', ['name' => 'Ada'], 'zh-hant')['htmlBody']);
+        self::assertSame('<p lang="pt-br">Bem-vinda, Ada</p>', $renderer->render('welcome', ['name' => 'Ada'], 'pt-BR')['htmlBody']);
     }
 
     /** A regional tag the site supports is kept whole; a primary subtag it does not support is not taken. */

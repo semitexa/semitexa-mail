@@ -49,6 +49,8 @@ final class MailServiceTest extends TestCase
 
     private string|false $eventsAsync = false;
 
+    private string|false $eventsTransport = false;
+
     protected function setUp(): void
     {
         MailTransportRegistry::reset();
@@ -59,13 +61,14 @@ final class MailServiceTest extends TestCase
         QueueTransportRegistry::reset();
         MailServiceQueueSpy::$published = [];
         $this->eventsAsync = getenv('EVENTS_ASYNC');
+        $this->eventsTransport = getenv('EVENTS_TRANSPORT');
     }
 
     protected function tearDown(): void
     {
         MailTransportRegistry::reset();
         QueueTransportRegistry::reset();
-        putenv('EVENTS_TRANSPORT');
+        putenv($this->eventsTransport === false ? 'EVENTS_TRANSPORT' : 'EVENTS_TRANSPORT=' . $this->eventsTransport);
         putenv($this->eventsAsync === false ? 'EVENTS_ASYNC' : 'EVENTS_ASYNC=' . $this->eventsAsync);
     }
 

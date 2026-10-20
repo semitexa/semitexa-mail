@@ -64,11 +64,13 @@ final class TwigMailTemplateRenderer implements MailTemplateRendererInterface
      * The locale as the site has it. An envelope may carry uk-UA, uk_UA or
      * UK; like the Accept-Language resolver, the full tag is taken when the
      * site supports it, else its primary subtag when that is supported, else
-     * the tag as given (the catalog then falls back on its own).
+     * the tag as given (the catalog then falls back on its own). Compared
+     * without regard to case or separator, and answered as the site spells
+     * it: zh-Hant is not zh-HANT, and a site that wrote pt-br wants pt-br.
      */
     private function supportedLocale(string $locale): string
     {
-        $parts = explode('-', str_replace('_', '-', strtolower(trim($locale))), 2);
+        $parts = explode('-', self::comparable($locale), 2);
         $primary = $parts[0];
         $tag = isset($parts[1]) ? $primary . '-' . strtoupper($parts[1]) : $primary;
 
@@ -78,11 +80,20 @@ final class TwigMailTemplateRenderer implements MailTemplateRendererInterface
             $supported = LocaleConfig::fromEnvironment()->supportedLocales;
         }
 
-        if (in_array($tag, $supported, true) || !in_array($primary, $supported, true)) {
-            return $tag;
+        foreach ([implode('-', $parts), $primary] as $wanted) {
+            foreach ($supported as $spelled) {
+                if (self::comparable($spelled) === $wanted) {
+                    return $spelled;
+                }
+            }
         }
 
-        return $primary;
+        return $tag;
+    }
+
+    private static function comparable(string $locale): string
+    {
+        return str_replace('_', '-', strtolower(trim($locale)));
     }
 
     /**
