@@ -7,7 +7,10 @@ namespace Semitexa\Mail\Tests\Unit;
 use PHPUnit\Framework\Attributes\Test;
 use PHPUnit\Framework\TestCase;
 use Semitexa\Core\Queue\WorkerProcess;
+use Semitexa\Mail\Application\Service\EnvMailerConfigResolver;
 use Semitexa\Mail\Application\Service\MailWorkerProcesses;
+use Semitexa\Mail\Domain\Contract\MailerConfigResolverInterface;
+use Semitexa\Mail\Domain\Model\MailerConfig;
 
 /** What the worker container runs for mail (tk-worker-runs-mail-work). */
 final class MailWorkerProcessesTest extends TestCase
@@ -56,9 +59,40 @@ final class MailWorkerProcessesTest extends TestCase
         self::assertSame([], $this->lines());
     }
 
-    /** @return list<string> */
-    private function lines(): array
+    /**
+     * REGRESSION (tk-mail-worker-per-tenant-queues). MailService queues a mail
+     * on the queue the mailer config resolver names; the worker read
+     * MAIL_QUEUE itself, so a resolver that names another queue had its mail
+     * queued where no mail:work read it. The worker now asks the resolver.
+     */
+    #[Test]
+    public function the_queue_is_the_one_the_mailer_config_resolver_names(): void
     {
-        return array_map(static fn (WorkerProcess $p): string => $p->line(), (new MailWorkerProcesses())->workerProcesses());
+        putenv('EVENTS_TRANSPORT=nats');
+        putenv('MAIL_QUEUE=outbox');
+
+        self::assertSame(['5 mail:work nats transactional'], $this->lines(new MailWorkerFixtureResolver('transactional')));
+    }
+
+    /** @return list<string> */
+    private function lines(MailerConfigResolverInterface $resolver = new EnvMailerConfigResolver()): array
+    {
+        $source = new MailWorkerProcesses();
+        // What the container injects.
+        (new \ReflectionProperty($source, 'mailerConfigResolver'))->setValue($source, $resolver);
+
+        return array_map(static fn (WorkerProcess $p): string => $p->line(), $source->workerProcesses());
+    }
+}
+
+final class MailWorkerFixtureResolver implements MailerConfigResolverInterface
+{
+    public function __construct(private readonly string $queue)
+    {
+    }
+
+    public function resolve(?string $tenantId = null, ?string $mailerKey = null): MailerConfig
+    {
+        return new MailerConfig(queue: $this->queue);
     }
 }
