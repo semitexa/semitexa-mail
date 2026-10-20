@@ -74,14 +74,29 @@ final class MailWorkerProcessesTest extends TestCase
         self::assertSame(['5 mail:work nats transactional'], $this->lines(new MailWorkerFixtureResolver('transactional')));
     }
 
+    /** So worker:processes can refuse a queue:work on the mail queue (tk-nats-consumer-name-collision). */
+    #[Test]
+    public function mail_work_says_which_queue_it_reads(): void
+    {
+        putenv('EVENTS_TRANSPORT=nats');
+
+        self::assertSame([['nats', 'mail']], array_map(static fn (WorkerProcess $p): ?array => $p->reads, $this->processes()));
+    }
+
     /** @return list<string> */
     private function lines(MailerConfigResolverInterface $resolver = new EnvMailerConfigResolver()): array
+    {
+        return array_map(static fn (WorkerProcess $p): string => $p->line(), $this->processes($resolver));
+    }
+
+    /** @return list<WorkerProcess> */
+    private function processes(MailerConfigResolverInterface $resolver = new EnvMailerConfigResolver()): array
     {
         $source = new MailWorkerProcesses();
         // What the container injects.
         (new \ReflectionProperty($source, 'mailerConfigResolver'))->setValue($source, $resolver);
 
-        return array_map(static fn (WorkerProcess $p): string => $p->line(), $source->workerProcesses());
+        return $source->workerProcesses();
     }
 }
 

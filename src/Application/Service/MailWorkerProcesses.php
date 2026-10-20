@@ -34,6 +34,8 @@ final class MailWorkerProcesses implements WorkerProcessSourceInterface
             return [];
         }
 
-        return [new WorkerProcess(['mail:work', $transport, $this->mailerConfigResolver->resolve()->queue])];
+        $queue = $this->mailerConfigResolver->resolve()->queue;
+
+        return [new WorkerProcess(['mail:work', $transport, $queue], reads: [$transport, $queue])];
     }
 }
