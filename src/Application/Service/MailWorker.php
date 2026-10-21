@@ -7,6 +7,7 @@ namespace Semitexa\Mail\Application\Service;
 use Semitexa\Core\Environment;
 use Semitexa\Core\Queue\DelayedQueueTransportInterface;
 use Semitexa\Core\Queue\QueueConfig;
+use Semitexa\Core\Queue\QueueStatsRecorder;
 use Semitexa\Core\Queue\QueueTransportRegistry;
 use Semitexa\Mail\Domain\Model\MailAttempt;
 use Semitexa\Mail\Domain\Model\MailMessage;
@@ -30,6 +31,12 @@ final class MailWorker
     private ?string $currentQueue     = null;
     private ?OutputInterface $output  = null;
     private int $nextSweepAt = 0;
+    /** What the message being processed came to, for queue:stats: null counts nothing. */
+    private ?string $outcome = null;
+    /** When the attempt's own work ended: before a retry's delay, which is not run time. */
+    private ?float $attemptEndedAt = null;
+    private ?QueueStatsRecorder $stats = null;
+    private bool $statsResolved = false;
 
     public function __construct(
         private readonly MailRepositoryInterface $mailRepository,
@@ -38,6 +45,16 @@ final class MailWorker
         private readonly AttachmentResolver $attachmentResolver,
         private readonly ?MailRetentionInterface $retention = null,
     ) {}
+
+    /** For tests: record into this, for $queue, instead of the configured store. */
+    public function withStats(?QueueStatsRecorder $stats, string $queue): self
+    {
+        $this->stats = $stats;
+        $this->statsResolved = true;
+        $this->currentQueue = $queue;
+
+        return $this;
+    }
 
     public function setOutput(?OutputInterface $output): void
     {
@@ -100,7 +117,39 @@ final class MailWorker
             return;
         }
 
-        $this->processMessage($message);
+        $this->outcome = null;
+        $this->attemptEndedAt = null;
+        $startedAt = microtime(true);
+        try {
+            $this->processMessage($message);
+        } finally {
+            $this->recordStats($message, $startedAt);
+        }
+    }
+
+    /**
+     * Sent, retried or failed for good, into the same per-queue counters
+     * queue:work writes, so queue:stats and the Queues app count mail too. A
+     * skipped message (already sent, its row gone, an outcome another worker
+     * wrote first) counts nothing. No wait: queuedAt has whole seconds, which
+     * would put every wait in the 1 s bucket.
+     */
+    private function recordStats(QueuedMailMessage $message, float $startedAt): void
+    {
+        if ($this->outcome === null || $this->currentQueue === null) {
+            return;
+        }
+        if (!$this->statsResolved) {
+            $this->statsResolved = true;
+            $this->stats = QueueStatsRecorder::fromEnvironment();
+        }
+        $this->stats?->record(
+            $this->currentQueue,
+            $this->outcome === 'dead_lettered' ? 'dead_lettered' : 'processed',
+            $this->outcome === 'retried',
+            null,
+            (int) round((($this->attemptEndedAt ?? microtime(true)) - $startedAt) * 1000),
+        );
     }
 
     /**
@@ -222,6 +271,7 @@ final class MailWorker
         $startedAt  = new \DateTimeImmutable();
         $result     = $transport->deliver($prepared, $config);
         $finishedAt = new \DateTimeImmutable();
+        $this->attemptEndedAt = microtime(true);
 
         // Record attempt
         $attemptNo               = $this->attemptRepository->countByMessageId($message->messageId) + 1;
@@ -248,6 +298,7 @@ final class MailWorker
                 'errorCode' => null,
                 'errorMessage' => null,
             ]));
+            $this->outcome = 'processed';
             $this->log("Mail '{$message->messageId}' sent (attempt {$attemptNo}).", 'success');
             return;
         }
@@ -275,13 +326,16 @@ final class MailWorker
             }
             $requeueError = $this->requeueMessage($message, $config->queue);
             if ($requeueError !== null) {
-                $this->mailRepository->saveOutcomeUnlessSent($mailMessage->with([
+                if ($this->mailRepository->saveOutcomeUnlessSent($mailMessage->with([
                     'status' => MailMessageStatus::EnqueueFailed->value,
                     'errorCode' => MailErrorCode::QueueUnavailable->value,
                     'errorMessage' => "The retry could not be queued: {$requeueError}",
-                ]));
+                ]))) {
+                    $this->outcome = 'dead_lettered';
+                }
                 return;
             }
+            $this->outcome = 'retried';
             $nextAttempt = $message->attempts + 1;
             $this->log("Mail '{$message->messageId}' deferred — retry {$nextAttempt}/{$message->maxRetries}.", 'warning');
             return;
@@ -298,12 +352,15 @@ final class MailWorker
         ?string $errorCode,
         ?string $errorMessage,
     ): void {
-        // Never over a `sent` another worker wrote meanwhile.
-        $this->mailRepository->saveOutcomeUnlessSent($mailMessage->with([
+        // Never over a `sent` another worker wrote meanwhile; and then this
+        // worker failed nothing, so it counts nothing.
+        if ($this->mailRepository->saveOutcomeUnlessSent($mailMessage->with([
             'status' => MailMessageStatus::Failed->value,
             'errorCode' => $errorCode,
             'errorMessage' => $errorMessage,
-        ]));
+        ]))) {
+            $this->outcome = 'dead_lettered';
+        }
     }
 
     /** The same queue message again, its attempts and queuedAt unchanged, $delay seconds later. */

@@ -8,6 +8,8 @@ use PHPUnit\Framework\Attributes\Test;
 use PHPUnit\Framework\TestCase;
 use Semitexa\Core\Queue\QueueTransportFactoryInterface;
 use Semitexa\Core\Queue\QueueTransportInterface;
+use Semitexa\Core\Queue\QueueStatsRecorder;
+use Semitexa\Core\Queue\QueueStatsStoreInterface;
 use Semitexa\Core\Queue\QueueTransportRegistry;
 use Semitexa\Mail\Application\Service\AttachmentResolver;
 use Semitexa\Mail\Application\Service\FakeMailTransport;
@@ -433,6 +435,45 @@ final class MailServiceTest extends TestCase
 
         self::assertSame('enqueue_failed', $this->messages->byId($id)?->getStatus());
         self::assertSame('queue_unavailable', $this->messages->byId($id)?->getErrorCode());
+    }
+
+    #[Test]
+    public function the_worker_counts_what_it_sent_retried_and_failed_for_queue_stats(): void
+    {
+        // mail:work recorded nothing, so queue:stats and the Queues app
+        // listed the mail queue with no throughput at all.
+        $store = new class implements QueueStatsStoreInterface {
+            /** @var list<array<string, int>> */
+            public array $added = [];
+            public function add(string $queue, int $minute, array $deltas): void { $this->added[] = ['queue' => $queue] + $deltas; }
+            public function sum(string $queue, int $fromMinute, int $toMinute): array { return []; }
+            public function describe(): string { return 'test'; }
+        };
+        $counted = function (string $driver) use ($store): MailWorker {
+            return $this->worker($driver)->withStats(new QueueStatsRecorder($store), 'mail');
+        };
+        $this->spyOnTheQueue();
+
+        $sent = $this->queuedMessage();
+        $counted('fake')->processPayload((new QueuedMailMessage(messageId: $sent))->toJson());
+        $counted('fake')->processPayload((new QueuedMailMessage(messageId: $sent))->toJson()); // already sent: nothing
+        $retried = $this->queuedMessage();
+        MailTransportRegistry::register(new MailServiceScriptedTransport(new MailTransportResult(status: MailTransportStatus::Failed, errorCode: 'timeout', errorMessage: 'SMTP timed out')));
+        $counted('scripted')->processPayload((new QueuedMailMessage(messageId: $retried, attempts: 0, maxRetries: 2, retryDelay: 0))->toJson());
+        $failed = $this->queuedMessage();
+        $counted('no-such-driver')->processPayload((new QueuedMailMessage(messageId: $failed, attempts: 1))->toJson());
+        $unqueued = $this->queuedMessage();
+        MailServiceQueueSpy::$refuse = true;
+        $counted('scripted')->processPayload((new QueuedMailMessage(messageId: $unqueued, attempts: 0, maxRetries: 2, retryDelay: 0))->toJson());
+
+        self::assertCount(4, $store->added);
+        [$a, $b, $c, $d] = $store->added;
+        self::assertSame(['mail', 1], [$a['queue'], $a['processed'] ?? null]);
+        self::assertSame(1, $b['retried'] ?? null);
+        self::assertArrayNotHasKey('processed', $b);
+        self::assertSame(1, $c['dead_lettered'] ?? null);
+        self::assertSame(1, $d['dead_lettered'] ?? null, 'a retry that could not be queued failed for good');
+        self::assertArrayNotHasKey('wait_count', $a, 'queuedAt has whole seconds: no wait is better than a wrong one');
     }
 
     #[Test]
