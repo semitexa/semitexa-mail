@@ -479,6 +479,38 @@ final class MailServiceTest extends TestCase
         self::assertEqualsWithDelta((new \DateTimeImmutable('-30 days'))->getTimestamp(), $retention->cutoffs[0]->getTimestamp(), 5);
     }
 
+    /** @return iterable<string, array{string, int}> */
+    public static function overwrites(): iterable
+    {
+        // [error code the slow worker gets, guarded write the fast one beats]
+        yield 'sent before the slow worker marks it sending' => ['timeout', 1];
+        yield 'sent before the slow worker writes deferred' => ['timeout', 2];
+        yield 'sent before the slow worker writes failed' => ['invalid_recipient', 2];
+    }
+
+    #[Test]
+    #[\PHPUnit\Framework\Attributes\DataProvider('overwrites')]
+    public function a_slower_worker_never_overwrites_a_sent_another_worker_wrote(string $errorCode, int $at): void
+    {
+        // A redelivered message processed twice at once: the slower worker's
+        // sending, deferred or failed landed over the faster one's sent.
+        $this->spyOnTheQueue();
+        $id = $this->queuedMessage();
+        MailTransportRegistry::register(new MailServiceScriptedTransport(new MailTransportResult(status: MailTransportStatus::Failed, errorCode: $errorCode, errorMessage: 'refused')));
+        $this->messages->meanwhileAt = $at;
+        $this->messages->meanwhile = static function (MailServiceMessages $messages) use ($id): void {
+            $row = $messages->byId($id);
+            if ($row !== null) {
+                $messages->save($row->with(['status' => 'sent']));
+            }
+        };
+
+        $this->worker(driver: 'scripted')->processPayload((new QueuedMailMessage(messageId: $id, attempts: 0, maxRetries: 2, retryDelay: 0))->toJson());
+
+        self::assertSame('sent', $this->messages->byId($id)?->getStatus());
+        self::assertSame([], MailServiceQueueSpy::$published, 'no retry for a mail already sent');
+    }
+
     #[Test]
     public function a_permanent_failure_is_not_retried(): void
     {
@@ -631,6 +663,26 @@ final class MailServiceMessages implements MailRepositoryInterface
         $this->byId[$saved->getId()] = $saved;
 
         return $saved;
+    }
+
+    /** Called just before guarded write number $meanwhileAt: what another worker does in between. */
+    public ?\Closure $meanwhile = null;
+
+    public int $meanwhileAt = 1;
+
+    private int $guardedWrites = 0;
+
+    public function saveOutcomeUnlessSent(MailMessage $entity): bool
+    {
+        if ($this->meanwhile !== null && ++$this->guardedWrites === $this->meanwhileAt) {
+            ($this->meanwhile)($this);
+        }
+        if (($this->byId[$entity->getId()] ?? null)?->getStatus() === 'sent') {
+            return false;
+        }
+        $this->byId[$entity->getId()] = $entity;
+
+        return true;
     }
 }
 

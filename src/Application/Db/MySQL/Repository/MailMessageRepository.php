@@ -10,6 +10,7 @@ use Semitexa\Mail\Application\Db\MySQL\Model\MailMessageResource;
 use Semitexa\Mail\Domain\Model\MailMessage;
 use Semitexa\Mail\Domain\Contract\MailRepositoryInterface;
 use Semitexa\Mail\Domain\Contract\MailRetentionInterface;
+use Semitexa\Orm\Application\Service\Uuid7;
 use Semitexa\Orm\OrmManager;
 use Semitexa\Orm\Query\Operator;
 use Semitexa\Orm\Query\SystemScopeToken;
@@ -83,6 +84,37 @@ class MailMessageRepository implements MailRepositoryInterface, MailRetentionInt
         );
     }
 
+    public function saveOutcomeUnlessSent(MailMessage $entity): bool
+    {
+        $utc = new \DateTimeZone('UTC');
+        $id = Uuid7::toBytes($entity->getId());
+        $changed = $this->orm()->getQueryAdapter()->execute(
+            "UPDATE mail_messages
+             SET status = :status, error_code = :error_code, error_message = :error_message,
+                 provider_message_id = :provider_message_id,
+                 last_attempt_at = COALESCE(:last_attempt_at, last_attempt_at), updated_at = :updated_at
+             WHERE id = :id AND status <> 'sent'",
+            [
+                'status' => $entity->getStatus(),
+                'error_code' => $entity->getErrorCode(),
+                'error_message' => $entity->getErrorMessage(),
+                'provider_message_id' => $entity->getProviderMessageId(),
+                'last_attempt_at' => $entity->getLastAttemptAt()?->setTimezone($utc)->format('Y-m-d H:i:s'),
+                'updated_at' => (new \DateTimeImmutable('now', $utc))->format('Y-m-d H:i:s'),
+                'id' => $id,
+            ],
+        )->rowCount;
+        if ($changed > 0) {
+            return true;
+        }
+
+        // MySQL counts changed rows: 0 is also "the same values written
+        // again". Only a row that is sent was refused.
+        $row = $this->orm()->getQueryAdapter()->execute('SELECT status FROM mail_messages WHERE id = :id', ['id' => $id])->rows[0] ?? null;
+
+        return $row !== null && $row['status'] !== 'sent';
+    }
+
     public function deleteFinishedBefore(\DateTimeImmutable $cutoff, int $limit): int
     {
         $adapter = $this->orm()->getQueryAdapter();
@@ -91,7 +123,7 @@ class MailMessageRepository implements MailRepositoryInterface, MailRetentionInt
         // read every finished row in the retained window.
         $ids = array_column($adapter->execute(
             "SELECT id FROM mail_messages WHERE status IN ({$finished}) AND updated_at < :cutoff LIMIT " . max(1, min($limit, 500)),
-            ['cutoff' => $cutoff->format('Y-m-d H:i:s')],
+            ['cutoff' => $cutoff->setTimezone(new \DateTimeZone('UTC'))->format('Y-m-d H:i:s')],
         )->rows, 'id');
         if ($ids === []) {
             return 0;
@@ -106,7 +138,7 @@ class MailMessageRepository implements MailRepositoryInterface, MailRetentionInt
 
         return $adapter->execute(
             "DELETE FROM mail_messages WHERE id IN ({$in}) AND status IN ({$finished}) AND updated_at < :cutoff",
-            $params + ['cutoff' => $cutoff->format('Y-m-d H:i:s')],
+            $params + ['cutoff' => $cutoff->setTimezone(new \DateTimeZone('UTC'))->format('Y-m-d H:i:s')],
         )->rowCount;
     }
 

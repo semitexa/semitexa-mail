@@ -161,11 +161,16 @@ final class MailWorker
             return;
         }
 
-        // Mark as sending
-        $mailMessage = $this->mailRepository->save($mailMessage->with([
+        // Mark as sending, unless another worker on a redelivered copy has
+        // sent it since the read above: a plain save set it back to sending.
+        $mailMessage = $mailMessage->with([
             'status' => MailMessageStatus::Sending->value,
             'lastAttemptAt' => new \DateTimeImmutable(),
-        ]));
+        ]);
+        if (!$this->mailRepository->saveOutcomeUnlessSent($mailMessage)) {
+            $this->log("Mail message '{$message->messageId}' already sent — skipping.", 'info');
+            return;
+        }
 
         try {
             // With its mailerKey: the worker resolved every queued mail to the
@@ -255,17 +260,22 @@ final class MailWorker
         $isRetryable = $errorCode?->isRetryable() ?? ($result->status === MailTransportStatus::Deferred);
 
         if ($isRetryable && $message->attempts < $message->maxRetries) {
-            // Deferred before the retry is published, so a fast worker's
-            // `sent` is never overwritten; and if it cannot be published the
-            // row says so instead of waiting for a retry that does not exist.
-            $mailMessage = $this->mailRepository->save($mailMessage->with([
+            // Deferred before the retry is published, and never over a `sent`
+            // another worker wrote meanwhile (a redelivered message processed
+            // twice at once); if it cannot be published the row says so
+            // instead of waiting for a retry that does not exist.
+            $mailMessage = $mailMessage->with([
                 'status' => MailMessageStatus::Deferred->value,
                 'errorCode' => $result->errorCode,
                 'errorMessage' => $result->errorMessage,
-            ]));
+            ]);
+            if (!$this->mailRepository->saveOutcomeUnlessSent($mailMessage)) {
+                $this->log("Mail '{$message->messageId}' was sent by another worker meanwhile.", 'info');
+                return;
+            }
             $requeueError = $this->requeueMessage($message, $config->queue);
             if ($requeueError !== null) {
-                $this->mailRepository->save($mailMessage->with([
+                $this->mailRepository->saveOutcomeUnlessSent($mailMessage->with([
                     'status' => MailMessageStatus::EnqueueFailed->value,
                     'errorCode' => MailErrorCode::QueueUnavailable->value,
                     'errorMessage' => "The retry could not be queued: {$requeueError}",
@@ -288,7 +298,8 @@ final class MailWorker
         ?string $errorCode,
         ?string $errorMessage,
     ): void {
-        $this->mailRepository->save($mailMessage->with([
+        // Never over a `sent` another worker wrote meanwhile.
+        $this->mailRepository->saveOutcomeUnlessSent($mailMessage->with([
             'status' => MailMessageStatus::Failed->value,
             'errorCode' => $errorCode,
             'errorMessage' => $errorMessage,
