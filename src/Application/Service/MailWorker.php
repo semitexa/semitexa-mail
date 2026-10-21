@@ -4,12 +4,14 @@ declare(strict_types=1);
 
 namespace Semitexa\Mail\Application\Service;
 
+use Semitexa\Core\Environment;
 use Semitexa\Core\Queue\DelayedQueueTransportInterface;
 use Semitexa\Core\Queue\QueueConfig;
 use Semitexa\Core\Queue\QueueTransportRegistry;
 use Semitexa\Mail\Domain\Model\MailAttempt;
 use Semitexa\Mail\Domain\Model\MailMessage;
 use Semitexa\Mail\Domain\Contract\MailAttemptRepositoryInterface;
+use Semitexa\Mail\Domain\Contract\MailRetentionInterface;
 use Semitexa\Mail\Domain\Contract\MailRepositoryInterface;
 use Semitexa\Mail\Domain\Contract\MailerConfigResolverInterface;
 use Semitexa\Mail\Domain\Model\QueuedMailMessage;
@@ -27,12 +29,14 @@ final class MailWorker
     private ?string $currentTransport = null;
     private ?string $currentQueue     = null;
     private ?OutputInterface $output  = null;
+    private int $nextSweepAt = 0;
 
     public function __construct(
         private readonly MailRepositoryInterface $mailRepository,
         private readonly MailAttemptRepositoryInterface $attemptRepository,
         private readonly MailerConfigResolverInterface $configResolver,
         private readonly AttachmentResolver $attachmentResolver,
+        private readonly ?MailRetentionInterface $retention = null,
     ) {}
 
     public function setOutput(?OutputInterface $output): void
@@ -66,6 +70,17 @@ final class MailWorker
     public function processPayload(string $payload): void
     {
         try {
+            $this->processPayloadNow($payload);
+        } finally {
+            // After the message, never before it: a reset or one-time code
+            // must not wait behind the cleanup.
+            $this->sweepOldMail();
+        }
+    }
+
+    private function processPayloadNow(string $payload): void
+    {
+        try {
             $data = json_decode($payload, true, 512, JSON_THROW_ON_ERROR);
         } catch (\Throwable $e) {
             $this->log("Failed to decode mail queue message: {$e->getMessage()}", 'error');
@@ -86,6 +101,39 @@ final class MailWorker
         }
 
         $this->processMessage($message);
+    }
+
+    /**
+     * With MAIL_RETENTION_DAYS set, sent and failed mail older than that goes,
+     * with its attempts, at most once an hour: nothing deleted a row, inline
+     * attachments included. 0 (the default) keeps everything.
+     */
+    private function sweepOldMail(): void
+    {
+        $days = (int) Environment::getEnvValue('MAIL_RETENTION_DAYS', '0');
+        if ($this->retention === null || $days <= 0 || time() < $this->nextSweepAt) {
+            return;
+        }
+        $this->nextSweepAt = time() + 3600;
+
+        try {
+            $cutoff = (new \DateTimeImmutable())->modify("-{$days} days");
+            $deleted = 0;
+            // At most 20 batches and about two seconds: the rest waits an hour.
+            $until = microtime(true) + 2.0;
+            for ($batch = 0; $batch < 20 && microtime(true) < $until; $batch++) {
+                $n = $this->retention->deleteFinishedBefore($cutoff, 500);
+                $deleted += $n;
+                if ($n < 500) {
+                    break;
+                }
+            }
+            if ($deleted > 0) {
+                $this->log("Deleted {$deleted} sent or failed mail(s) older than {$days} days.");
+            }
+        } catch (\Throwable $e) {
+            $this->log("Mail retention sweep failed: {$e->getMessage()}", 'warning');
+        }
     }
 
     private function processMessage(QueuedMailMessage $message): void

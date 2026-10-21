@@ -397,6 +397,35 @@ final class MailServiceTest extends TestCase
     }
 
     #[Test]
+    public function with_mail_retention_set_the_worker_sweeps_old_mail_at_most_hourly(): void
+    {
+        $retention = new class implements \Semitexa\Mail\Domain\Contract\MailRetentionInterface {
+            /** @var list<\DateTimeImmutable> */
+            public array $cutoffs = [];
+
+            public function deleteFinishedBefore(\DateTimeImmutable $cutoff, int $limit): int
+            {
+                $this->cutoffs[] = $cutoff;
+
+                return 0;
+            }
+        };
+        $worker = new MailWorker($this->messages, $this->attempts, $this->config('fake'), (new \ReflectionClass(AttachmentResolver::class))->newInstanceWithoutConstructor(), $retention);
+        $worker->setOutput(new NullOutput());
+        $previous = getenv('MAIL_RETENTION_DAYS');
+        putenv('MAIL_RETENTION_DAYS=30');
+        try {
+            $worker->processPayload('{"type":"other"}');
+            $worker->processPayload('{"type":"other"}');
+        } finally {
+            $previous === false ? putenv('MAIL_RETENTION_DAYS') : putenv("MAIL_RETENTION_DAYS={$previous}");
+        }
+
+        self::assertCount(1, $retention->cutoffs, 'once, not on every message');
+        self::assertEqualsWithDelta((new \DateTimeImmutable('-30 days'))->getTimestamp(), $retention->cutoffs[0]->getTimestamp(), 5);
+    }
+
+    #[Test]
     public function a_permanent_failure_is_not_retried(): void
     {
         $this->spyOnTheQueue();

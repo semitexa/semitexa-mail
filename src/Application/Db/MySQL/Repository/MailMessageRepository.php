@@ -9,13 +9,14 @@ use Semitexa\Core\Attribute\SatisfiesRepositoryContract;
 use Semitexa\Mail\Application\Db\MySQL\Model\MailMessageResource;
 use Semitexa\Mail\Domain\Model\MailMessage;
 use Semitexa\Mail\Domain\Contract\MailRepositoryInterface;
+use Semitexa\Mail\Domain\Contract\MailRetentionInterface;
 use Semitexa\Orm\OrmManager;
 use Semitexa\Orm\Query\Operator;
 use Semitexa\Orm\Query\SystemScopeToken;
 use Semitexa\Orm\Repository\DomainRepository;
 
 #[SatisfiesRepositoryContract(of: MailRepositoryInterface::class)]
-class MailMessageRepository implements MailRepositoryInterface
+class MailMessageRepository implements MailRepositoryInterface, MailRetentionInterface
 {
     #[InjectAsReadonly]
     protected OrmManager $orm;
@@ -80,6 +81,33 @@ class MailMessageRepository implements MailRepositoryInterface
             MailMessageResource::class,
             MailMessage::class,
         );
+    }
+
+    public function deleteFinishedBefore(\DateTimeImmutable $cutoff, int $limit): int
+    {
+        $adapter = $this->orm()->getAdapter();
+        $finished = "'sent', 'failed'";
+        // Through idx_mail_messages_status_updated: without it, every sweep
+        // read every finished row in the retained window.
+        $ids = array_column($adapter->execute(
+            "SELECT id FROM mail_messages WHERE status IN ({$finished}) AND updated_at < :cutoff LIMIT " . max(1, min($limit, 500)),
+            ['cutoff' => $cutoff->format('Y-m-d H:i:s')],
+        )->rows, 'id');
+        if ($ids === []) {
+            return 0;
+        }
+
+        $params = [];
+        foreach (array_values($ids) as $i => $id) {
+            $params["id{$i}"] = $id;
+        }
+        $in = ':' . implode(', :', array_keys($params));
+        $adapter->execute("DELETE FROM mail_attempts WHERE mail_message_id IN ({$in})", $params);
+
+        return $adapter->execute(
+            "DELETE FROM mail_messages WHERE id IN ({$in}) AND status IN ({$finished}) AND updated_at < :cutoff",
+            $params + ['cutoff' => $cutoff->format('Y-m-d H:i:s')],
+        )->rowCount;
     }
 
     private function orm(): OrmManager
