@@ -369,6 +369,30 @@ final class MailServiceTest extends TestCase
     }
 
     #[Test]
+    public function a_message_whose_row_is_not_committed_yet_is_looked_at_again_and_a_stale_one_dropped(): void
+    {
+        // send() in a transaction publishes before the commit: the worker
+        // found no row and dropped the mail.
+        QueueTransportRegistry::register('mail-test-delayed', new class implements \Semitexa\Core\Queue\QueueTransportFactoryInterface {
+            public function create(): \Semitexa\Core\Queue\QueueTransportInterface
+            {
+                return new MailServiceDelayedQueueSpy();
+            }
+        });
+        putenv('EVENTS_TRANSPORT=mail-test-delayed');
+        MailServiceDelayedQueueSpy::$delayed = [];
+
+        $this->worker()->processPayload((new QueuedMailMessage(messageId: 'not-committed-yet'))->toJson());
+        $this->worker()->processPayload((new QueuedMailMessage(messageId: 'rolled-back', queuedAt: date(DATE_ATOM, time() - 60)))->toJson());
+
+        self::assertCount(1, MailServiceDelayedQueueSpy::$delayed, 'the fresh one only');
+        self::assertStringContainsString('not-committed-yet', MailServiceDelayedQueueSpy::$delayed[0][1]);
+        self::assertSame(3, MailServiceDelayedQueueSpy::$delayed[0][2]);
+        $again = QueuedMailMessage::fromJson(MailServiceDelayedQueueSpy::$delayed[0][1]);
+        self::assertGreaterThan(time() - 30, strtotime($again->queuedAt), 'queuedAt kept, so the looking stops');
+    }
+
+    #[Test]
     public function a_redelivered_queue_message_does_not_send_twice(): void
     {
         $this->spyOnTheQueue();
@@ -675,5 +699,24 @@ final class MailServiceQueueSpyFactory implements QueueTransportFactoryInterface
     public function create(): QueueTransportInterface
     {
         return new MailServiceQueueSpy();
+    }
+}
+
+final class MailServiceDelayedQueueSpy implements \Semitexa\Core\Queue\DelayedQueueTransportInterface
+{
+    /** @var list<array{string, string, int}> */
+    public static array $delayed = [];
+
+    public function publish(string $queueName, string $payload): void
+    {
+    }
+
+    public function publishDelayed(string $queueName, string $payload, int $delaySeconds): void
+    {
+        self::$delayed[] = [$queueName, $payload, $delaySeconds];
+    }
+
+    public function consume(string $queueName, callable $callback): void
+    {
     }
 }

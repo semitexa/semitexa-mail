@@ -85,7 +85,7 @@ class MailMessageRepository implements MailRepositoryInterface, MailRetentionInt
 
     public function deleteFinishedBefore(\DateTimeImmutable $cutoff, int $limit): int
     {
-        $adapter = $this->orm()->getAdapter();
+        $adapter = $this->orm()->getQueryAdapter();
         $finished = "'sent', 'failed'";
         // Through idx_mail_messages_status_updated: without it, every sweep
         // read every finished row in the retained window.

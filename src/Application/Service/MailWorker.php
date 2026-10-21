@@ -141,6 +141,16 @@ final class MailWorker
         $mailMessage = $this->mailRepository->findById($message->messageId);
 
         if ($mailMessage === null) {
+            // send() inside a transaction publishes before that transaction
+            // commits: a worker that is quicker than the commit found no row
+            // and dropped the mail. A fresh message is looked at again a few
+            // seconds later; one whose row never appears (the sender rolled
+            // back) is dropped after 30 s.
+            $queuedAt = strtotime($message->queuedAt) ?: 0;
+            if (time() - $queuedAt < 30 && $this->republishLater($message, 3)) {
+                $this->log("Mail message '{$message->messageId}' not in the DB yet — looking again shortly.", 'info');
+                return;
+            }
             $this->log("Mail message '{$message->messageId}' not found in DB — discarding.", 'warning');
             return;
         }
@@ -283,6 +293,26 @@ final class MailWorker
             'errorCode' => $errorCode,
             'errorMessage' => $errorMessage,
         ]));
+    }
+
+    /** The same queue message again, its attempts and queuedAt unchanged, $delay seconds later. */
+    private function republishLater(QueuedMailMessage $message, int $delay): bool
+    {
+        try {
+            $transport = QueueTransportRegistry::create($this->currentTransport ?? QueueConfig::defaultTransport());
+            // Only where the transport holds it back: a sleep here would stall
+            // every mail behind it, the reason retries no longer sleep.
+            if (!$transport instanceof DelayedQueueTransportInterface) {
+                return false;
+            }
+            $transport->publishDelayed($this->currentQueue ?? 'mail', $message->toJson(), $delay);
+
+            return true;
+        } catch (\Throwable $e) {
+            $this->log("Could not look at mail '{$message->messageId}' again: {$e->getMessage()}", 'warning');
+
+            return false;
+        }
     }
 
     /**
