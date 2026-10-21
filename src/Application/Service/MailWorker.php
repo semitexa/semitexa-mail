@@ -185,7 +185,7 @@ final class MailWorker
         $prepared              = new PreparedMailMessage();
         $prepared->messageId   = $message->messageId;
         $prepared->from        = new MailRecipient($mailMessage->getFromEmail(), $mailMessage->getFromName());
-        $prepared->replyTo     = $mailMessage->getReplyTo() !== null ? new MailRecipient($mailMessage->getReplyTo()) : null;
+        $prepared->replyTo     = $mailMessage->getReplyTo() !== null ? new MailRecipient($mailMessage->getReplyTo(), $mailMessage->getReplyToName()) : null;
         $prepared->to          = $this->arrayToRecipients($mailMessage->getTo());
         $prepared->cc          = $this->arrayToRecipients($mailMessage->getCc());
         $prepared->bcc         = $this->arrayToRecipients($mailMessage->getBcc());

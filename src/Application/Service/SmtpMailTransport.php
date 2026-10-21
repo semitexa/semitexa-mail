@@ -45,7 +45,7 @@ final class SmtpMailTransport implements MailTransportInterface
             $socket = $this->connect($config, $encryption);
             $this->readResponse($socket, 220);
 
-            $this->sendEhlo($socket);
+            $ehlo = $this->sendEhlo($socket);
 
             if ($encryption === 'tls') {
                 $this->sendCommand($socket, 'STARTTLS', 220);
@@ -54,11 +54,11 @@ final class SmtpMailTransport implements MailTransportInterface
                 if (@stream_socket_enable_crypto($socket, true, STREAM_CRYPTO_METHOD_TLSv1_2_CLIENT | STREAM_CRYPTO_METHOD_TLSv1_3_CLIENT) !== true) {
                     throw new MailTlsException("STARTTLS with {$config->host} failed: " . (error_get_last()['message'] ?? 'certificate not trusted, or no common TLS version'));
                 }
-                $this->sendEhlo($socket);
+                $ehlo = $this->sendEhlo($socket);
             }
 
             if ($config->username !== null && $config->password !== null) {
-                $this->authenticate($socket, $config->username, $config->password);
+                $this->authenticate($socket, $config->username, $config->password, $ehlo);
             }
 
             $this->sendCommand($socket, "MAIL FROM:<{$message->from->email}>", 250);
@@ -173,22 +173,42 @@ final class SmtpMailTransport implements MailTransportInterface
 
     /**
      * @param resource $socket
+     * @return string the EHLO reply (its AUTH lines name the mechanisms), '' after HELO
      */
-    private function sendEhlo($socket): void
+    private function sendEhlo($socket): string
     {
         $name = self::clientName($socket);
         try {
-            $this->sendCommand($socket, "EHLO {$name}", 250);
+            return $this->sendCommand($socket, "EHLO {$name}", 250);
         } catch (SmtpException) {
             $this->sendCommand($socket, "HELO {$name}", 250);
+
+            return '';
         }
     }
 
     /**
      * @param resource $socket
      */
-    private function authenticate($socket, string $username, string $password): void
+    private function authenticate($socket, string $username, string $password, string $ehloReply): void
     {
+        // LOGIN as before, PLAIN when the server offers only that (LOGIN was
+        // the one mechanism, and such servers refused every send).
+        if (self::authMechanism($ehloReply) === 'PLAIN') {
+            $credentials = base64_encode("\0{$username}\0{$password}");
+            fwrite($socket, "AUTH PLAIN {$credentials}\r\n");
+            try {
+                $this->readResponse($socket, 235);
+            } catch (SmtpException $e) {
+                // A server that wants the credentials as a continuation (334).
+                if ($e->smtpCode !== 334) {
+                    throw $e;
+                }
+                $this->sendCommand($socket, $credentials, 235);
+            }
+
+            return;
+        }
         $this->sendCommand($socket, 'AUTH LOGIN', 334);
         $this->sendCommand($socket, base64_encode($username), 334);
         $this->sendCommand($socket, base64_encode($password), 235);
@@ -262,6 +282,18 @@ final class SmtpMailTransport implements MailTransportInterface
     public static function isDomain(string $name): bool
     {
         return preg_match('/^(?=.{1,253}$)([A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+[A-Za-z]{2,63}$/', $name) === 1;
+    }
+
+    /** PLAIN when the EHLO reply offers PLAIN and not LOGIN, LOGIN otherwise. */
+    public static function authMechanism(string $ehloReply): string
+    {
+        preg_match_all('/^250[ -]AUTH[ =](.*)$/mi', $ehloReply, $m);
+        $offered = [];
+        foreach ($m[1] as $line) {
+            $offered = [...$offered, ...(preg_split('/\s+/', strtoupper(trim($line))) ?: [])];
+        }
+
+        return in_array('PLAIN', $offered, true) && !in_array('LOGIN', $offered, true) ? 'PLAIN' : 'LOGIN';
     }
 
     public static function isTemporary(int $smtpCode): bool

@@ -54,6 +54,8 @@ final readonly class MailMessage
         private ?\DateTimeImmutable $updatedAt = null,
         /** The envelope's mailerKey: the worker resolves the same mailer send() did. */
         private ?string $mailerKey = null,
+        /** The Reply-To display name; the address alone was kept. */
+        private ?string $replyToName = null,
     ) {}
 
     public function getId(): string
@@ -153,6 +155,11 @@ final readonly class MailMessage
         return $this->attachments;
     }
 
+    public function getReplyToName(): ?string
+    {
+        return $this->replyToName;
+    }
+
     public function getMailerKey(): ?string
     {
         return $this->mailerKey;
@@ -242,6 +249,7 @@ final readonly class MailMessage
                 ? ($changes['updatedAt'] instanceof \DateTimeImmutable ? $changes['updatedAt'] : null)
                 : new \DateTimeImmutable(),
             mailerKey: $this->mailerKey,
+            replyToName: $this->replyToName,
         );
     }
 }

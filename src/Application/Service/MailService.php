@@ -150,6 +150,7 @@ final class MailService implements MailServiceInterface
             attachments: array_map($this->serializeAttachment(...), $envelope->attachments),
             idempotencyKey: $envelope->idempotencyKey,
             mailerKey: $envelope->mailerKey,
+            replyToName: $envelope->replyTo !== null ? $envelope->replyTo->name : null,
             ));
         } catch (ConstraintViolationException $e) {
             // A concurrent send() with the same key stored it first.
@@ -300,7 +301,7 @@ final class MailService implements MailServiceInterface
         $prepared              = new PreparedMailMessage();
         $prepared->messageId   = $messageId;
         $prepared->from        = new MailRecipient($mailMessage->getFromEmail(), $mailMessage->getFromName());
-        $prepared->replyTo     = $mailMessage->getReplyTo() !== null ? new MailRecipient($mailMessage->getReplyTo()) : null;
+        $prepared->replyTo     = $mailMessage->getReplyTo() !== null ? new MailRecipient($mailMessage->getReplyTo(), $mailMessage->getReplyToName()) : null;
         $prepared->to          = $this->arrayToRecipients($mailMessage->getTo());
         $prepared->cc          = $this->arrayToRecipients($mailMessage->getCc());
         $prepared->bcc         = $this->arrayToRecipients($mailMessage->getBcc());

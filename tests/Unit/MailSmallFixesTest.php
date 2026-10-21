@@ -112,4 +112,15 @@ final class MailSmallFixesTest extends TestCase
 
         return $message;
     }
+
+    #[Test]
+    public function auth_plain_is_used_when_the_server_offers_it_and_not_login(): void
+    {
+        // Only AUTH LOGIN was spoken; some servers offer only PLAIN.
+        self::assertSame('PLAIN', \Semitexa\Mail\Application\Service\SmtpMailTransport::authMechanism("250-mail.example\r\n250-AUTH PLAIN\r\n250 8BITMIME\r\n"));
+        self::assertSame('LOGIN', \Semitexa\Mail\Application\Service\SmtpMailTransport::authMechanism("250-mail.example\r\n250 AUTH LOGIN PLAIN CRAM-MD5\r\n"), 'LOGIN, as before, when both are offered');
+        self::assertSame('PLAIN', \Semitexa\Mail\Application\Service\SmtpMailTransport::authMechanism("250-mail.example\r\n250-AUTH=CRAM-MD5\r\n250 AUTH PLAIN\r\n"), 'every AUTH line counts');
+        self::assertSame('LOGIN', \Semitexa\Mail\Application\Service\SmtpMailTransport::authMechanism("250-mail.example\r\n250 AUTH LOGIN\r\n"));
+        self::assertSame('LOGIN', \Semitexa\Mail\Application\Service\SmtpMailTransport::authMechanism(''));
+    }
 }

@@ -355,6 +355,20 @@ final class MailServiceTest extends TestCase
     }
 
     #[Test]
+    public function the_reply_to_name_reaches_the_message(): void
+    {
+        // The address was stored, the name dropped.
+        $this->spyOnTheQueue();
+        $envelope = $this->envelope(subject: 'Hi', text: 'x');
+        $envelope->replyTo = new MailRecipient('support@example.test', 'Support Team');
+        $this->service()->send($envelope, new MailSendOptions(mode: MailSendMode::Queued));
+
+        $this->worker()->processPayload(MailServiceQueueSpy::$published[0][1]);
+
+        self::assertSame('Support Team', $this->fake->getLastMessage()?->replyTo?->name);
+    }
+
+    #[Test]
     public function a_redelivered_queue_message_does_not_send_twice(): void
     {
         $this->spyOnTheQueue();

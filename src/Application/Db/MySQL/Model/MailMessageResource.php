@@ -115,6 +115,9 @@ final readonly class MailMessageResource
 
         #[Column(type: MySqlType::Varchar, length: 128, nullable: true)]
         public ?string $mailer_key = null,
+
+        #[Column(type: MySqlType::Varchar, length: 255, nullable: true)]
+        public ?string $reply_to_name = null,
     ) {
     }
 
