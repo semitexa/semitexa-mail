@@ -6,10 +6,12 @@ namespace Semitexa\Mail\Application\Service;
 
 use Semitexa\Core\Attribute\InjectAsReadonly;
 use Semitexa\Core\Attribute\SatisfiesServiceContract;
+use Semitexa\Core\Log\StaticLoggerBridge;
 use Semitexa\Core\Queue\DelayedQueueTransportInterface;
 use Semitexa\Core\Queue\QueueConfig;
 use Semitexa\Core\Queue\QueueTransportRegistry;
 use Semitexa\Orm\Exception\ConstraintViolationException;
+use Semitexa\Orm\OrmManager;
 use Semitexa\Mail\Domain\Model\MailAttempt;
 use Semitexa\Mail\Domain\Model\MailMessage;
 use Semitexa\Mail\Domain\Contract\MailAttemptRepositoryInterface;
@@ -49,6 +51,13 @@ final class MailService implements MailServiceInterface
 
     #[InjectAsReadonly]
     protected AttachmentResolver $attachmentResolver;
+
+    /**
+     * The connection mail_messages lives on: its transaction decides when a
+     * mail may leave. Optional only for a MailService built by hand in a test.
+     */
+    #[InjectAsReadonly(optional: true)]
+    protected OrmManager $orm;
 
     public function send(MailEnvelope $envelope, ?MailSendOptions $options = null): MailDispatchResult
     {
@@ -205,7 +214,42 @@ final class MailService implements MailServiceInterface
         };
     }
 
+    /**
+     * Inside the caller's transaction the stored row is part of it, and the
+     * mail leaves only once it commits. Sent at once (no async events) or
+     * published at once, a rolled-back order still mailed its customer, and
+     * runWithRetry() replaying the unit mailed them twice: the rollback had
+     * taken the idempotency key with it.
+     */
     private function deliverOrQueue(MailMessage $mailMessage, MailSendOptions $options, MailerConfig $config): MailDispatchResult
+    {
+        $transaction = isset($this->orm) ? $this->orm->getTransactionManager() : null;
+        if ($transaction !== null && $transaction->isActive()) {
+            // A resend of a failed row: pending inside the transaction, so a
+            // second send() of the key before the commit answers Queued
+            // instead of holding back a second delivery.
+            if ($mailMessage->getStatus() !== MailMessageStatus::Pending->value) {
+                $mailMessage = $this->mailRepository->save($mailMessage->with(['status' => MailMessageStatus::Pending->value]));
+            }
+            $transaction->afterCommit(function () use ($mailMessage, $options, $config): void {
+                // The caller was told Queued: a failure now is in the row, and here.
+                $result = $this->deliverNow($mailMessage, $options, $config);
+                if (!$result->succeeded()) {
+                    StaticLoggerBridge::error('mail', 'A mail sent inside a transaction failed after the commit.', [
+                        'message_id' => $result->messageId,
+                        'status' => $result->status->value,
+                        'error_code' => $result->errorCode,
+                    ]);
+                }
+            });
+
+            return new MailDispatchResult(status: MailDispatchStatus::Queued, messageId: $mailMessage->getId());
+        }
+
+        return $this->deliverNow($mailMessage, $options, $config);
+    }
+
+    private function deliverNow(MailMessage $mailMessage, MailSendOptions $options, MailerConfig $config): MailDispatchResult
     {
         if ($options->mode === MailSendMode::Queued && !$this->queueIsProcessLocal()) {
             return $this->dispatchToQueue($mailMessage, $mailMessage->getId(), $config->queue);

@@ -33,6 +33,8 @@ use Semitexa\Mail\Domain\Model\MailSendOptions;
 use Semitexa\Mail\Domain\Model\MailTransportResult;
 use Semitexa\Mail\Domain\Model\PreparedMailMessage;
 use Semitexa\Mail\Domain\Model\QueuedMailMessage;
+use Semitexa\Orm\Domain\Model\ConnectionConfig;
+use Semitexa\Orm\OrmManager;
 use Symfony\Component\Console\Output\NullOutput;
 
 /**
@@ -89,6 +91,64 @@ final class MailServiceTest extends TestCase
         self::assertSame(['ada@example.test'], array_map(static fn (MailRecipient $r): string => $r->email, $sent?->to ?? []));
         self::assertSame('sent', $this->messages->byId($result->messageId)?->getStatus());
         self::assertCount(1, $this->attempts->saved, 'every delivery attempt is recorded');
+    }
+
+    /** Sent in the call, a rolled-back order still mailed its customer, and a replayed one mailed them twice. */
+    #[Test]
+    public function inside_a_transaction_the_mail_leaves_only_once_it_commits(): void
+    {
+        $orm = new OrmManager(config: new ConnectionConfig(driver: 'sqlite', sqliteMemory: true), connectionName: 'mail_tx_probe');
+        $service = $this->service(orm: $orm);
+
+        $result = $orm->getTransactionManager()->run(function () use ($service) {
+            $result = $service->send($this->envelope(subject: 'Receipt', text: 'Paid'), $this->now());
+            self::assertSame(0, $this->fake->count(), 'nothing leaves before the commit');
+
+            return $result;
+        });
+
+        self::assertSame(MailDispatchStatus::Queued, $result->status, 'accepted, not yet sent, when send() returned');
+        self::assertSame(1, $this->fake->count());
+        self::assertSame('sent', $this->messages->byId($result->messageId)?->getStatus());
+        $orm->shutdown();
+    }
+
+    /** Both resends saw `failed` and both held back a delivery: the mail went out twice. */
+    #[Test]
+    public function a_failed_mail_resent_twice_in_one_transaction_goes_out_once(): void
+    {
+        MailTransportRegistry::register(new MailServiceScriptedTransport(new MailTransportResult(status: MailTransportStatus::Failed, errorCode: 'network_error', errorMessage: 'refused')));
+        $envelope = $this->envelope(subject: 'Receipt', text: 'Paid');
+        $envelope->idempotencyKey = 'receipt-7';
+        self::assertSame(MailDispatchStatus::Failed, $this->service(driver: 'scripted')->send($envelope, $this->now())->status);
+
+        $orm = new OrmManager(config: new ConnectionConfig(driver: 'sqlite', sqliteMemory: true), connectionName: 'mail_tx_probe');
+        $service = $this->service(orm: $orm);
+        $orm->getTransactionManager()->run(function () use ($service, $envelope): void {
+            $service->send($envelope, $this->now());
+            $service->send(clone $envelope, $this->now());
+        });
+
+        self::assertSame(1, $this->fake->count());
+        $orm->shutdown();
+    }
+
+    #[Test]
+    public function a_rolled_back_transaction_sends_nothing(): void
+    {
+        $orm = new OrmManager(config: new ConnectionConfig(driver: 'sqlite', sqliteMemory: true), connectionName: 'mail_tx_probe');
+        $service = $this->service(orm: $orm);
+
+        try {
+            $orm->getTransactionManager()->run(function () use ($service): void {
+                $service->send($this->envelope(subject: 'Receipt', text: 'Paid'), $this->now());
+                throw new \RuntimeException('the order failed');
+            });
+        } catch (\RuntimeException) {
+        }
+
+        self::assertSame(0, $this->fake->count());
+        $orm->shutdown();
     }
 
     #[Test]
@@ -613,7 +673,7 @@ final class MailServiceTest extends TestCase
         return new MailSendOptions(mode: MailSendMode::Sync);
     }
 
-    private function service(string $driver = 'fake'): MailService
+    private function service(string $driver = 'fake', ?OrmManager $orm = null): MailService
     {
         $service = new MailService();
         foreach ([
@@ -622,6 +682,7 @@ final class MailServiceTest extends TestCase
             'mailRepository' => $this->messages,
             'attemptRepository' => $this->attempts,
             'attachmentResolver' => (new \ReflectionClass(AttachmentResolver::class))->newInstanceWithoutConstructor(),
+            ...($orm !== null ? ['orm' => $orm] : []),
         ] as $property => $value) {
             (new \ReflectionProperty(MailService::class, $property))->setValue($service, $value);
         }

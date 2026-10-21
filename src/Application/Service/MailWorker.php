@@ -192,11 +192,12 @@ final class MailWorker
         $mailMessage = $this->mailRepository->findById($message->messageId);
 
         if ($mailMessage === null) {
-            // send() inside a transaction publishes before that transaction
-            // commits: a worker that is quicker than the commit found no row
-            // and dropped the mail. A fresh message is looked at again a few
-            // seconds later; one whose row never appears (the sender rolled
-            // back) is dropped after 30 s.
+            // MailService publishes after the commit of a transaction on its
+            // own connection, but a sender in a transaction it cannot see (raw
+            // PDO, another connection) still publishes first: a worker quicker
+            // than that commit found no row and dropped the mail. A fresh
+            // message is looked at again a few seconds later; one whose row
+            // never appears (the sender rolled back) is dropped after 30 s.
             $queuedAt = strtotime($message->queuedAt) ?: 0;
             if (time() - $queuedAt < 30 && $this->republishLater($message, 3)) {
                 $this->log("Mail message '{$message->messageId}' not in the DB yet — looking again shortly.", 'info');
