@@ -104,6 +104,22 @@ final class MailServiceTest extends TestCase
     }
 
     #[Test]
+    public function an_inline_attachment_over_the_limit_is_refused_before_anything_is_stored(): void
+    {
+        $envelope = $this->envelope(subject: 'Big', text: 'x');
+        $envelope->attachments = [new \Semitexa\Mail\Domain\Model\AttachmentReference('big.bin', inlineContents: str_repeat('x', \Semitexa\Mail\Domain\Model\AttachmentReference::MAX_INLINE_SIZE + 1))];
+
+        $result = $this->service()->send($envelope, $this->now());
+
+        self::assertSame(MailDispatchStatus::Failed, $result->status);
+        self::assertSame('attachment_missing', $result->errorCode);
+        self::assertNull($result->messageId);
+        self::assertSame([], $this->attempts->saved);
+        self::assertSame(0, $this->messages->count(), 'nothing stored');
+        self::assertSame(0, $this->fake->count());
+    }
+
+    #[Test]
     public function a_template_renders_the_subject_and_bodies(): void
     {
         $envelope = $this->envelope();
@@ -544,6 +560,11 @@ final class MailServiceMessages implements MailRepositoryInterface
     private array $byId = [];
 
     private int $next = 0;
+
+    public function count(): int
+    {
+        return count($this->byId);
+    }
 
     public function byId(?string $id): ?MailMessage
     {

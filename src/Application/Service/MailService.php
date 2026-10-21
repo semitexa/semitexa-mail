@@ -84,6 +84,18 @@ final class MailService implements MailServiceInterface
             );
         }
 
+        // The inline limit was checked only at delivery, after the mail was
+        // stored and queued, and failed there as a missing attachment.
+        foreach ($envelope->attachments as $attachment) {
+            if ($attachment->inlineContents !== null && strlen($attachment->inlineContents) > AttachmentReference::MAX_INLINE_SIZE) {
+                return new MailDispatchResult(
+                    status:       MailDispatchStatus::Failed,
+                    errorCode:    MailErrorCode::AttachmentMissing->value,
+                    errorMessage: "Inline attachment '{$attachment->filename}' exceeds the 256 KB size limit: use a storage-backed reference for large files.",
+                );
+            }
+        }
+
         // Render template or use inline bodies
         $subject  = $envelope->subject ?? '';
         $htmlBody = $envelope->htmlBody;
