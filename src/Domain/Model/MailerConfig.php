@@ -23,4 +23,20 @@ final readonly class MailerConfig
         /** Check the server's TLS certificate and host name; off only for a local test server. */
         public bool $verifyPeer = true,
     ) {}
+
+    /**
+     * `tls`, `ssl` or null for plain text. Case and spaces do not matter,
+     * `starttls` is `tls`, and none/false/0/off/'' mean plain text; any other
+     * value is returned as it is, and the SMTP transport refuses it.
+     */
+    public static function normalizeEncryption(?string $value): ?string
+    {
+        $value = $value === null ? null : strtolower(trim($value));
+
+        return match ($value) {
+            null, '', 'none', 'false', '0', 'off' => null,
+            'starttls' => 'tls',
+            default => $value,
+        };
+    }
 }

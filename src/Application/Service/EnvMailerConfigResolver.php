@@ -19,7 +19,7 @@ final class EnvMailerConfigResolver implements MailerConfigResolverInterface
             port:           (int) $this->env('MAIL_PORT', '1025'),
             username:       $this->envOrNull('MAIL_USERNAME'),
             password:       $this->envOrNull('MAIL_PASSWORD'),
-            encryption:     $this->envOrNull('MAIL_ENCRYPTION'),
+            encryption:     MailerConfig::normalizeEncryption($this->envOrNull('MAIL_ENCRYPTION')),
             fromEmail:      $this->env('MAIL_FROM_EMAIL', 'noreply@localhost'),
             fromName:       $this->envOrNull('MAIL_FROM_NAME'),
             replyTo:        $this->envOrNull('MAIL_REPLY_TO'),

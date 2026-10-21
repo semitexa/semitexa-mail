@@ -50,6 +50,7 @@ final class MailMessageMapper implements ResourceModelMapperInterface
             lastAttemptAt: $resourceModel->last_attempt_at,
             createdAt: $resourceModel->created_at,
             updatedAt: $resourceModel->updated_at,
+            mailerKey: $resourceModel->mailer_key,
         );
     }
 
@@ -88,6 +89,7 @@ final class MailMessageMapper implements ResourceModelMapperInterface
             last_attempt_at: $domainModel->getLastAttemptAt(),
             created_at: $domainModel->getCreatedAt(),
             updated_at: $domainModel->getUpdatedAt(),
+            mailer_key: $domainModel->getMailerKey(),
         );
     }
 

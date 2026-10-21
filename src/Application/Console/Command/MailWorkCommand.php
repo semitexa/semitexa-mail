@@ -40,7 +40,7 @@ final class MailWorkCommand extends Command
             ->addArgument(
                 name:        'transport',
                 mode:        InputArgument::OPTIONAL,
-                description: 'Queue transport: nats or in-memory (default from EVENTS_ASYNC)',
+                description: 'Queue transport: database, nats or in-memory (default from EVENTS_ASYNC / EVENTS_TRANSPORT)',
                 default:     null,
             )
             ->addArgument(

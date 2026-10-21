@@ -40,7 +40,12 @@ final class MimeBuilder
         $lines[] = 'Subject: ' . $this->encodeHeader($message->subject, strlen('Subject: '));
         $lines[] = 'MIME-Version: 1.0';
         $lines[] = 'Date: ' . gmdate('D, d M Y H:i:s +0000');
-        $lines[] = 'Message-ID: <' . $message->messageId . '>';
+        // An id with no domain is not a valid Message-ID (RFC 5322 id-right).
+        $domain = (string) substr(strrchr($message->from->email, '@') ?: '@localhost', 1);
+        if (function_exists('idn_to_ascii') && preg_match('/[^\x20-\x7E]/', $domain) === 1) {
+            $domain = (string) (idn_to_ascii($domain) ?: $domain);
+        }
+        $lines[] = 'Message-ID: <' . $message->messageId . '@' . (SmtpMailTransport::isDomain($domain) ? $domain : 'localhost') . '>';
 
         foreach ($message->headers as $name => $value) {
             // A field name is printable ASCII without a colon (RFC 5322 2.2); the

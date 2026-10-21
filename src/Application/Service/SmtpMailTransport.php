@@ -33,19 +33,28 @@ final class SmtpMailTransport implements MailTransportInterface
     {
         $socket = null;
         try {
-            $socket = $this->connect($config);
+            // Both before the connection: a bad MAIL_ENCRYPTION or a message
+            // the builder refuses touched the network first, and could be
+            // reported as a network error and retried.
+            $encryption = MailerConfig::normalizeEncryption($config->encryption);
+            if ($encryption !== null && !in_array($encryption, ['tls', 'ssl'], true)) {
+                throw new MailTlsException("MAIL_ENCRYPTION '{$config->encryption}' is not tls or ssl: nothing is sent in plain text instead.");
+            }
+            $mime = $this->mimeBuilder->build($message);
+
+            $socket = $this->connect($config, $encryption);
             $this->readResponse($socket, 220);
 
-            $this->sendEhlo($socket, $config);
+            $this->sendEhlo($socket);
 
-            if ($config->encryption === 'tls') {
+            if ($encryption === 'tls') {
                 $this->sendCommand($socket, 'STARTTLS', 220);
                 // A failed handshake left the connection in plain text, and
                 // AUTH went out over it.
                 if (@stream_socket_enable_crypto($socket, true, STREAM_CRYPTO_METHOD_TLSv1_2_CLIENT | STREAM_CRYPTO_METHOD_TLSv1_3_CLIENT) !== true) {
                     throw new MailTlsException("STARTTLS with {$config->host} failed: " . (error_get_last()['message'] ?? 'certificate not trusted, or no common TLS version'));
                 }
-                $this->sendEhlo($socket, $config);
+                $this->sendEhlo($socket);
             }
 
             if ($config->username !== null && $config->password !== null) {
@@ -61,7 +70,6 @@ final class SmtpMailTransport implements MailTransportInterface
 
             $this->sendCommand($socket, 'DATA', 354);
 
-            $mime = $this->mimeBuilder->build($message);
             $data = $mime['headers'] . "\r\n" . $mime['body'];
 
             // Dot-stuffing
@@ -92,6 +100,14 @@ final class SmtpMailTransport implements MailTransportInterface
                 errorMessage: $e->getMessage(),
                 providerResponse: ['smtp_code' => $e->smtpCode, 'smtp_response' => $e->smtpResponse],
             );
+        } catch (\InvalidArgumentException $e) {
+            // A malformed message (a custom header name the MIME builder
+            // refuses): sending it again builds the same message.
+            return new MailTransportResult(
+                status: MailTransportStatus::Failed,
+                errorCode: MailErrorCode::ConfigError->value,
+                errorMessage: $e->getMessage(),
+            );
         } catch (MailTlsException $e) {
             // Not network_error: the worker retries that, and a certificate
             // problem was retried four times, a minute apart.
@@ -116,9 +132,9 @@ final class SmtpMailTransport implements MailTransportInterface
     /**
      * @return resource
      */
-    private function connect(MailerConfig $config)
+    private function connect(MailerConfig $config, ?string $encryption)
     {
-        $protocol = $config->encryption === 'ssl' ? 'ssl' : 'tcp';
+        $protocol = $encryption === 'ssl' ? 'ssl' : 'tcp';
         $address = "{$protocol}://{$config->host}:{$config->port}";
 
         // Certificates are checked: with checking off, anyone on the path
@@ -144,7 +160,7 @@ final class SmtpMailTransport implements MailTransportInterface
             // With ssl:// a certificate failure reports errno 0 and an empty
             // errstr; the reason is only in the last PHP warning.
             $reason = trim($errstr) !== '' ? $errstr : (string) (error_get_last()['message'] ?? '');
-            if ($config->encryption === 'ssl' && preg_match('/ssl|certificate|tls/i', $reason) === 1) {
+            if ($encryption === 'ssl' && preg_match('/ssl|certificate|tls/i', $reason) === 1) {
                 throw new MailTlsException("TLS with {$config->host} failed: {$reason}");
             }
             throw new SmtpException("Connection failed: {$reason} ({$errno})", 0, '');
@@ -158,12 +174,13 @@ final class SmtpMailTransport implements MailTransportInterface
     /**
      * @param resource $socket
      */
-    private function sendEhlo($socket, MailerConfig $config): void
+    private function sendEhlo($socket): void
     {
+        $name = self::clientName($socket);
         try {
-            $this->sendCommand($socket, "EHLO {$config->host}", 250);
+            $this->sendCommand($socket, "EHLO {$name}", 250);
         } catch (SmtpException) {
-            $this->sendCommand($socket, "HELO {$config->host}", 250);
+            $this->sendCommand($socket, "HELO {$name}", 250);
         }
     }
 
@@ -218,6 +235,35 @@ final class SmtpMailTransport implements MailTransportInterface
      * opposite for HTTP providers, which is how greylisted mail failed for
      * good and a 554 rejection was retried.
      */
+    /**
+     * The name EHLO announces: this client's (it sent the server's own name,
+     * MAIL_HOST). A host name that is not a full domain (a container's hex id)
+     * is refused by strict servers, so it is then the address literal of the
+     * local end of the connection.
+     *
+     * @param resource $socket
+     */
+    private static function clientName($socket): string
+    {
+        $name = gethostname();
+        if (is_string($name) && self::isDomain($name)) {
+            return $name;
+        }
+        $local = stream_socket_get_name($socket, false);
+        $ip = is_string($local) ? preg_replace('/:\d+$/', '', $local) : null;
+        if (is_string($ip) && filter_var(trim($ip, '[]'), FILTER_VALIDATE_IP, FILTER_FLAG_IPV6) !== false) {
+            return '[IPv6:' . trim($ip, '[]') . ']';
+        }
+
+        return is_string($ip) && filter_var($ip, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4) !== false ? "[{$ip}]" : '[127.0.0.1]';
+    }
+
+    /** A fully qualified domain name: dot-separated labels, a letters-only last one. */
+    public static function isDomain(string $name): bool
+    {
+        return preg_match('/^(?=.{1,253}$)([A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+[A-Za-z]{2,63}$/', $name) === 1;
+    }
+
     public static function isTemporary(int $smtpCode): bool
     {
         return $smtpCode === 0 || ($smtpCode >= 400 && $smtpCode < 500);

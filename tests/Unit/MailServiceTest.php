@@ -90,6 +90,20 @@ final class MailServiceTest extends TestCase
     }
 
     #[Test]
+    public function a_mail_with_no_recipient_is_refused_before_anything_is_stored(): void
+    {
+        $envelope = $this->envelope(subject: 'x', text: 'y');
+        $envelope->to = [];
+
+        $result = $this->service()->send($envelope, $this->now());
+
+        self::assertSame(MailDispatchStatus::Failed, $result->status);
+        self::assertSame('invalid_recipient', $result->errorCode);
+        self::assertNull($result->messageId);
+        self::assertSame(0, $this->fake->count());
+    }
+
+    #[Test]
     public function a_template_renders_the_subject_and_bodies(): void
     {
         $envelope = $this->envelope();
@@ -310,6 +324,21 @@ final class MailServiceTest extends TestCase
     }
 
     #[Test]
+    public function the_worker_resolves_the_mailer_the_sender_chose(): void
+    {
+        // It resolved the tenant's default mailer for every queued mail.
+        $this->spyOnTheQueue();
+        $envelope = $this->envelope(subject: 'News', text: 'x');
+        $envelope->mailerKey = 'marketing';
+        $this->service()->send($envelope, new MailSendOptions(mode: MailSendMode::Queued));
+        MailServiceConfig::$mailerKeys = [];
+
+        $this->worker()->processPayload(MailServiceQueueSpy::$published[0][1]);
+
+        self::assertContains('marketing', MailServiceConfig::$mailerKeys);
+    }
+
+    #[Test]
     public function a_redelivered_queue_message_does_not_send_twice(): void
     {
         $this->spyOnTheQueue();
@@ -461,8 +490,13 @@ final class MailServiceConfig implements MailerConfigResolverInterface
     {
     }
 
+    /** @var list<?string> the mailerKey of every resolve() */
+    public static array $mailerKeys = [];
+
     public function resolve(?string $tenantId = null, ?string $mailerKey = null): MailerConfig
     {
+        self::$mailerKeys[] = $mailerKey;
+
         return $this->config;
     }
 }

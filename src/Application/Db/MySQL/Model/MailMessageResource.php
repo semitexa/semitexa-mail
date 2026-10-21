@@ -111,6 +111,9 @@ final readonly class MailMessageResource
 
         #[Column(type: MySqlType::Datetime)]
         public ?\DateTimeImmutable $updated_at = null,
+
+        #[Column(type: MySqlType::Varchar, length: 128, nullable: true)]
+        public ?string $mailer_key = null,
     ) {
     }
 

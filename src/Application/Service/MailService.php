@@ -72,6 +72,18 @@ final class MailService implements MailServiceInterface
             }
         }
 
+        // A mail to nobody reached the SMTP server, was refused there, and was
+        // retried as a server error.
+        // After the key lookup: a resend sends the stored recipients.
+        $recipients = array_filter([...$envelope->to, ...$envelope->cc, ...$envelope->bcc], static fn (MailRecipient $r): bool => trim($r->email) !== '');
+        if ($recipients === []) {
+            return new MailDispatchResult(
+                status:       MailDispatchStatus::Failed,
+                errorCode:    MailErrorCode::InvalidRecipient->value,
+                errorMessage: 'The mail has no recipient: to, cc and bcc are all empty.',
+            );
+        }
+
         // Render template or use inline bodies
         $subject  = $envelope->subject ?? '';
         $htmlBody = $envelope->htmlBody;
@@ -125,6 +137,7 @@ final class MailService implements MailServiceInterface
             metadata: $envelope->metadata,
             attachments: array_map($this->serializeAttachment(...), $envelope->attachments),
             idempotencyKey: $envelope->idempotencyKey,
+            mailerKey: $envelope->mailerKey,
             ));
         } catch (ConstraintViolationException $e) {
             // A concurrent send() with the same key stored it first.
@@ -151,6 +164,15 @@ final class MailService implements MailServiceInterface
     private function again(MailMessage $existing, MailEnvelope $envelope, MailSendOptions $options, MailerConfig $config): MailDispatchResult
     {
         $id = $existing->getId();
+        // The row's mailer, as the worker resolves it: a resend sent now and
+        // one queued could otherwise go through different mailers.
+        if ($existing->getMailerKey() !== $envelope->mailerKey) {
+            try {
+                $config = $this->configResolver->resolve($existing->getTenantId(), $existing->getMailerKey());
+            } catch (\Throwable $e) {
+                return new MailDispatchResult(status: MailDispatchStatus::Failed, messageId: $id, errorCode: MailErrorCode::ConfigError->value, errorMessage: $e->getMessage());
+            }
+        }
 
         return match ($existing->getStatus()) {
             MailMessageStatus::Sent->value => new MailDispatchResult(status: MailDispatchStatus::Sent, messageId: $id),

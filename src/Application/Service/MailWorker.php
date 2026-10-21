@@ -43,7 +43,16 @@ final class MailWorker
     public function run(?string $transportName, ?string $queueName = null): void
     {
         $this->currentTransport = $transportName ?: QueueConfig::defaultTransport();
-        $this->currentQueue     = $queueName     ?: 'mail';
+        // MAIL_QUEUE, as send() publishes to; it read the literal 'mail'.
+        if ($queueName === null || $queueName === '') {
+            try {
+                $queueName = $this->configResolver->resolve()->queue;
+            } catch (\Throwable $e) {
+                $this->log("No mailer config without a tenant ({$e->getMessage()}); reading the 'mail' queue.", 'warning');
+                $queueName = 'mail';
+            }
+        }
+        $this->currentQueue     = $queueName;
 
         $transport = QueueTransportRegistry::create($this->currentTransport);
 
@@ -64,7 +73,8 @@ final class MailWorker
         }
 
         if (($data['type'] ?? '') !== QueuedMailMessage::TYPE) {
-            $this->log("Unexpected message type '{$data['type']}' on mail queue — skipping.", 'warning');
+            $type = is_array($data) && is_scalar($data['type'] ?? null) ? (string) $data['type'] : '(none)';
+            $this->log("Unexpected message type '{$type}' on mail queue — skipping.", 'warning');
             return;
         }
 
@@ -100,7 +110,9 @@ final class MailWorker
         ]));
 
         try {
-            $config = $this->configResolver->resolve($mailMessage->getTenantId());
+            // With its mailerKey: the worker resolved every queued mail to the
+            // tenant's default mailer, whichever one send() had chosen.
+            $config = $this->configResolver->resolve($mailMessage->getTenantId(), $mailMessage->getMailerKey());
         } catch (\Throwable $e) {
             $this->failMessage($mailMessage, MailErrorCode::ConfigError->value, $e->getMessage());
             $this->log("Config error for '{$message->messageId}': {$e->getMessage()}", 'error');
