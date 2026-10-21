@@ -6,6 +6,7 @@ namespace Semitexa\Mail\Application\Service;
 
 use Semitexa\Core\Attribute\InjectAsReadonly;
 use Semitexa\Core\Attribute\SatisfiesServiceContract;
+use Semitexa\Core\Queue\DelayedQueueTransportInterface;
 use Semitexa\Core\Queue\QueueConfig;
 use Semitexa\Core\Queue\QueueTransportRegistry;
 use Semitexa\Orm\Exception\ConstraintViolationException;
@@ -153,12 +154,15 @@ final class MailService implements MailServiceInterface
 
         return match ($existing->getStatus()) {
             MailMessageStatus::Sent->value => new MailDispatchResult(status: MailDispatchStatus::Sent, messageId: $id),
-            // Deferred has a retry on the queue already: another one would
-            // run a second chain, and two workers would both deliver.
             MailMessageStatus::Pending->value,
             MailMessageStatus::Queued->value,
-            MailMessageStatus::Sending->value,
-            MailMessageStatus::Deferred->value => new MailDispatchResult(status: MailDispatchStatus::Queued, messageId: $id),
+            MailMessageStatus::Sending->value => new MailDispatchResult(status: MailDispatchStatus::Queued, messageId: $id),
+            // Deferred has a retry on the queue already, unless the queue is
+            // this process's own: another one would run a second chain, and
+            // two workers would both deliver.
+            MailMessageStatus::Deferred->value => $this->queueIsProcessLocal()
+                ? $this->deliverOrQueue($existing, $options, $config)
+                : new MailDispatchResult(status: MailDispatchStatus::Queued, messageId: $id),
             default => in_array($existing->getErrorCode(), [MailErrorCode::InvalidRecipient->value, MailErrorCode::Provider5xx->value], true)
                 // Refused for good by the server: sending it again is refused again.
                 ? new MailDispatchResult(status: MailDispatchStatus::Failed, messageId: $id, errorCode: $existing->getErrorCode(), errorMessage: $existing->getErrorMessage())
@@ -272,7 +276,24 @@ final class MailService implements MailServiceInterface
         $prepared->headers     = $mailMessage->getHeaders();
         $prepared->attachments = $resolvedAttachments;
 
-        $transport  = MailTransportRegistry::get($config->driver);
+        // An unknown MAIL_DRIVER threw out of send() and left the row
+        // `sending` for good.
+        try {
+            $transport = MailTransportRegistry::get($config->driver);
+        } catch (\InvalidArgumentException $e) {
+            $this->mailRepository->save($mailMessage->with([
+                'status' => MailMessageStatus::Failed->value,
+                'errorCode' => MailErrorCode::ConfigError->value,
+                'errorMessage' => $e->getMessage(),
+            ]));
+
+            return new MailDispatchResult(
+                status:       MailDispatchStatus::Failed,
+                messageId:    $messageId,
+                errorCode:    MailErrorCode::ConfigError->value,
+                errorMessage: $e->getMessage(),
+            );
+        }
         $startedAt  = new \DateTimeImmutable();
         $result     = $transport->deliver($prepared, $config);
         $finishedAt = new \DateTimeImmutable();
@@ -314,6 +335,36 @@ final class MailService implements MailServiceInterface
                 status:    MailDispatchStatus::Sent,
                 messageId: $messageId,
             );
+        }
+
+        // A temporary failure of a mail sent at once was never tried again:
+        // the row stayed `deferred` for good. With a queue a worker reads, the
+        // retry goes there, as the worker's own retries do.
+        if ($finalStatus === MailMessageStatus::Deferred && !$this->queueIsProcessLocal()) {
+            $retry = new QueuedMailMessage(messageId: $messageId, attempts: 1);
+            try {
+                $queue = QueueTransportRegistry::create(QueueConfig::defaultTransport());
+                if ($queue instanceof DelayedQueueTransportInterface && $retry->retryDelay > 0) {
+                    $queue->publishDelayed($config->queue, $retry->toJson(), $retry->retryDelay);
+                } else {
+                    $queue->publish($config->queue, $retry->toJson());
+                }
+
+                return new MailDispatchResult(
+                    status:       MailDispatchStatus::Queued,
+                    messageId:    $messageId,
+                    errorCode:    $result->errorCode,
+                    errorMessage: $result->errorMessage,
+                );
+            } catch (\Throwable $e) {
+                // Left deferred, the next send() under its key would answer
+                // queued and nothing would ever deliver it.
+                $this->mailRepository->save($mailMessage->with([
+                    'status' => MailMessageStatus::EnqueueFailed->value,
+                    'errorCode' => MailErrorCode::QueueUnavailable->value,
+                    'errorMessage' => "The retry could not be queued: {$e->getMessage()}",
+                ]));
+            }
         }
 
         return new MailDispatchResult(

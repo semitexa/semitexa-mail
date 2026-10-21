@@ -30,6 +30,65 @@ final class MailHeaderInjectionTest extends TestCase
     }
 
     #[Test]
+    public function an_attachment_name_type_or_content_id_cannot_add_a_header(): void
+    {
+        // They went into the part headers as given.
+        $message = $this->message();
+        $message->attachments = [new \Semitexa\Mail\Domain\Model\ResolvedAttachment(
+            filename: "a.pdf\"\r\nBcc: attacker@evil.example\r\nX: \"",
+            mimeType: "application/pdf\r\nBcc: attacker@evil.example",
+            contents: '%PDF',
+            disposition: 'inline',
+            contentId: "cid1>\r\nBcc: attacker@evil.example",
+        )];
+
+        $body = (new MimeBuilder())->build($message)['body'];
+
+        self::assertDoesNotMatchRegularExpression('/^Bcc:/mi', $body);
+        self::assertStringContainsString('Content-Type: application/octet-stream;', $body);
+    }
+
+    #[Test]
+    public function a_non_ascii_attachment_name_is_also_sent_encoded(): void
+    {
+        $message = $this->message();
+        $message->attachments = [new \Semitexa\Mail\Domain\Model\ResolvedAttachment(filename: 'звіт.pdf', mimeType: 'application/pdf', contents: '%PDF')];
+
+        $body = (new MimeBuilder())->build($message)['body'];
+
+        self::assertStringContainsString("filename*=UTF-8''" . rawurlencode('звіт.pdf'), $body);
+        self::assertStringContainsString('filename="____.pdf"', $body, 'one underscore per character');
+    }
+
+    #[Test]
+    public function a_valid_type_with_parameters_and_an_unusual_content_id_are_kept(): void
+    {
+        // The HTML's cid: reference must still match the part.
+        $message = $this->message();
+        $message->attachments = [new \Semitexa\Mail\Domain\Model\ResolvedAttachment(filename: 'logo "v2".png', mimeType: 'text/csv; charset=utf-8', contents: 'x', disposition: 'inline', contentId: 'logo#1/2x')];
+
+        $body = (new MimeBuilder())->build($message)['body'];
+
+        self::assertStringContainsString('Content-Type: text/csv; charset=utf-8;', $body);
+        self::assertStringContainsString('Content-ID: <logo#1/2x>', $body);
+        self::assertStringContainsString('filename="logo \\"v2\\".png"', $body, 'a quote is escaped, not dropped');
+    }
+
+    #[Test]
+    public function a_very_long_non_ascii_name_stays_inside_the_line_limit(): void
+    {
+        $message = $this->message();
+        $message->attachments = [new \Semitexa\Mail\Domain\Model\ResolvedAttachment(filename: str_repeat('звіт', 60) . '.pdf', mimeType: 'application/pdf', contents: 'x')];
+
+        $body = (new MimeBuilder())->build($message)['body'];
+
+        foreach (explode("\r\n", $body) as $line) {
+            self::assertLessThanOrEqual(998, strlen($line));
+        }
+        self::assertStringContainsString('.pdf"', $body, 'the extension is kept');
+    }
+
+    #[Test]
     public function a_line_break_in_a_custom_header_value_cannot_add_a_header(): void
     {
         $message = $this->message();

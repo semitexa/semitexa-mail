@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Semitexa\Mail\Application\Service;
 
+use Semitexa\Core\Queue\DelayedQueueTransportInterface;
 use Semitexa\Core\Queue\QueueConfig;
 use Semitexa\Core\Queue\QueueTransportRegistry;
 use Semitexa\Mail\Domain\Model\MailAttempt;
@@ -134,7 +135,15 @@ final class MailWorker
         $prepared->headers     = $mailMessage->getHeaders();
         $prepared->attachments = $resolvedAttachments;
 
-        $transport  = MailTransportRegistry::get($config->driver);
+        // An unknown MAIL_DRIVER threw back to the queue, which redelivered
+        // until it gave up, and the row stayed `sending` for good.
+        try {
+            $transport = MailTransportRegistry::get($config->driver);
+        } catch (\InvalidArgumentException $e) {
+            $this->failMessage($mailMessage, MailErrorCode::ConfigError->value, $e->getMessage());
+            $this->log("Config error for '{$message->messageId}': {$e->getMessage()}", 'error');
+            return;
+        }
         $startedAt  = new \DateTimeImmutable();
         $result     = $transport->deliver($prepared, $config);
         $finishedAt = new \DateTimeImmutable();
@@ -176,12 +185,23 @@ final class MailWorker
         $isRetryable = $errorCode?->isRetryable() ?? ($result->status === MailTransportStatus::Deferred);
 
         if ($isRetryable && $message->attempts < $message->maxRetries) {
-            $this->requeueMessage($message, $config->queue, $result->errorCode, $result->errorMessage);
-            $this->mailRepository->save($mailMessage->with([
+            // Deferred before the retry is published, so a fast worker's
+            // `sent` is never overwritten; and if it cannot be published the
+            // row says so instead of waiting for a retry that does not exist.
+            $mailMessage = $this->mailRepository->save($mailMessage->with([
                 'status' => MailMessageStatus::Deferred->value,
                 'errorCode' => $result->errorCode,
                 'errorMessage' => $result->errorMessage,
             ]));
+            $requeueError = $this->requeueMessage($message, $config->queue);
+            if ($requeueError !== null) {
+                $this->mailRepository->save($mailMessage->with([
+                    'status' => MailMessageStatus::EnqueueFailed->value,
+                    'errorCode' => MailErrorCode::QueueUnavailable->value,
+                    'errorMessage' => "The retry could not be queued: {$requeueError}",
+                ]));
+                return;
+            }
             $nextAttempt = $message->attempts + 1;
             $this->log("Mail '{$message->messageId}' deferred — retry {$nextAttempt}/{$message->maxRetries}.", 'warning');
             return;
@@ -205,17 +225,16 @@ final class MailWorker
         ]));
     }
 
-    private function requeueMessage(
-        QueuedMailMessage $message,
-        string $queue,
-        ?string $errorCode,
-        ?string $errorMessage,
-    ): void {
+    /**
+     * Publish the next attempt. A transport that can hold a message back gets
+     * it delayed; the worker used to sleep the delay inside the consumer, and
+     * one failing mail held up every mail behind it.
+     *
+     * @return string|null why it could not be published
+     */
+    private function requeueMessage(QueuedMailMessage $message, string $queue): ?string
+    {
         try {
-            if ($message->retryDelay > 0) {
-                sleep($message->retryDelay);
-            }
-
             $retried             = clone $message;
             $retried->attempts   = $message->attempts + 1;
             $retried->queuedAt   = date(DATE_ATOM);
@@ -223,9 +242,21 @@ final class MailWorker
             $transport = QueueTransportRegistry::create(
                 $this->currentTransport ?? QueueConfig::defaultTransport(),
             );
+            if ($message->retryDelay > 0 && $transport instanceof DelayedQueueTransportInterface) {
+                $transport->publishDelayed($queue, $retried->toJson(), $message->retryDelay);
+
+                return null;
+            }
+            if ($message->retryDelay > 0) {
+                sleep($message->retryDelay);
+            }
             $transport->publish($queue, $retried->toJson());
+
+            return null;
         } catch (\Throwable $e) {
             $this->log("Failed to re-enqueue mail '{$message->messageId}': {$e->getMessage()}", 'error');
+
+            return $e->getMessage();
         }
     }
 

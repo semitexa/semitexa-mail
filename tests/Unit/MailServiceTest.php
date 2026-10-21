@@ -60,6 +60,7 @@ final class MailServiceTest extends TestCase
         $this->attempts = new MailServiceAttempts();
         QueueTransportRegistry::reset();
         MailServiceQueueSpy::$published = [];
+        MailServiceQueueSpy::$refuse = false;
         $this->eventsAsync = getenv('EVENTS_ASYNC');
         $this->eventsTransport = getenv('EVENTS_TRANSPORT');
     }
@@ -153,18 +154,64 @@ final class MailServiceTest extends TestCase
     }
 
     #[Test]
-    public function a_deferred_mail_already_has_its_retry_and_is_not_sent_again(): void
+    public function a_mail_deferred_at_once_gets_its_retry_on_the_queue_and_is_not_sent_again(): void
     {
-        // Sent again, it started a second retry chain beside the queued one.
+        // A temporary failure of a mail sent at once was never retried; and
+        // sent again under its key it would have run a second retry chain.
+        $this->spyOnTheQueue();
         MailTransportRegistry::register(new MailServiceScriptedTransport(new MailTransportResult(status: MailTransportStatus::Deferred, errorCode: 'provider_4xx', errorMessage: '451 try later')));
         $envelope = $this->envelope(subject: 'Receipt', text: 'Paid');
         $envelope->idempotencyKey = 'order-44-receipt';
 
-        $this->service(driver: 'scripted')->send($envelope, $this->now());
+        $first = $this->service(driver: 'scripted')->send($envelope, $this->now());
+        self::assertSame(MailDispatchStatus::Queued, $first->status, 'a retry is queued');
+        self::assertCount(1, MailServiceQueueSpy::$published);
+        self::assertStringContainsString('"attempts":1', MailServiceQueueSpy::$published[0][1]);
+
         $again = $this->service()->send(clone $envelope, $this->now());
 
         self::assertSame(MailDispatchStatus::Queued, $again->status);
+        self::assertCount(1, MailServiceQueueSpy::$published, 'no second retry');
         self::assertSame(0, $this->fake->count());
+    }
+
+    #[Test]
+    public function a_mail_deferred_at_once_whose_retry_cannot_be_queued_is_sent_again_under_its_key(): void
+    {
+        // Left deferred, every later send() answered queued and nothing
+        // delivered it.
+        $this->spyOnTheQueue();
+        MailServiceQueueSpy::$refuse = true;
+        MailTransportRegistry::register(new MailServiceScriptedTransport(new MailTransportResult(status: MailTransportStatus::Deferred, errorCode: 'provider_4xx', errorMessage: '451 try later')));
+        $envelope = $this->envelope(subject: 'Receipt', text: 'Paid');
+        $envelope->idempotencyKey = 'order-46-receipt';
+
+        $first = $this->service(driver: 'scripted')->send($envelope, $this->now());
+        self::assertSame('enqueue_failed', $this->messages->byId($first->messageId)?->getStatus());
+
+        MailServiceQueueSpy::$refuse = false;
+        $again = $this->service()->send(clone $envelope, $this->now());
+
+        self::assertSame(MailDispatchStatus::Sent, $again->status);
+        self::assertSame(1, $this->fake->count());
+    }
+
+    #[Test]
+    public function without_a_worker_a_deferred_mail_sent_again_is_delivered(): void
+    {
+        // With EVENTS_ASYNC=0 nothing holds a retry: answered "queued" it
+        // would never be delivered.
+        putenv('EVENTS_ASYNC=0');
+        putenv('EVENTS_TRANSPORT');
+        MailTransportRegistry::register(new MailServiceScriptedTransport(new MailTransportResult(status: MailTransportStatus::Deferred, errorCode: 'provider_4xx', errorMessage: '451 try later')));
+        $envelope = $this->envelope(subject: 'Receipt', text: 'Paid');
+        $envelope->idempotencyKey = 'order-45-receipt';
+
+        $this->service(driver: 'scripted')->send($envelope, $this->now());
+        $again = $this->service()->send(clone $envelope, $this->now());
+
+        self::assertSame(MailDispatchStatus::Sent, $again->status);
+        self::assertSame(1, $this->fake->count());
     }
 
     #[Test]
@@ -288,6 +335,36 @@ final class MailServiceTest extends TestCase
         self::assertCount(1, MailServiceQueueSpy::$published);
         self::assertSame('mail', MailServiceQueueSpy::$published[0][0]);
         self::assertSame(1, QueuedMailMessage::fromJson(MailServiceQueueSpy::$published[0][1])->attempts);
+    }
+
+    #[Test]
+    public function a_retry_that_cannot_be_queued_is_not_left_deferred(): void
+    {
+        // The row said deferred with nothing left to deliver it.
+        $this->spyOnTheQueue();
+        $id = $this->queuedMessage();
+        MailServiceQueueSpy::$refuse = true;
+        MailTransportRegistry::register(new MailServiceScriptedTransport(new MailTransportResult(status: MailTransportStatus::Failed, errorCode: 'timeout', errorMessage: 'SMTP timed out')));
+
+        $this->worker(driver: 'scripted')->processPayload((new QueuedMailMessage(messageId: $id, attempts: 0, maxRetries: 2, retryDelay: 0))->toJson());
+
+        self::assertSame('enqueue_failed', $this->messages->byId($id)?->getStatus());
+        self::assertSame('queue_unavailable', $this->messages->byId($id)?->getErrorCode());
+    }
+
+    #[Test]
+    public function an_unknown_driver_fails_the_mail_instead_of_leaving_it_sending(): void
+    {
+        $this->spyOnTheQueue();
+        $id = $this->queuedMessage();
+
+        $this->worker(driver: 'no-such-driver')->processPayload((new QueuedMailMessage(messageId: $id))->toJson());
+        $sync = $this->service(driver: 'no-such-driver')->send($this->envelope(subject: 'x', text: 'y'), $this->now());
+
+        self::assertSame('failed', $this->messages->byId($id)?->getStatus());
+        self::assertSame('config_error', $this->messages->byId($id)?->getErrorCode());
+        self::assertSame(MailDispatchStatus::Failed, $sync->status);
+        self::assertSame('failed', $this->messages->byId($sync->messageId)?->getStatus());
     }
 
     #[Test]
@@ -480,8 +557,13 @@ final class MailServiceQueueSpy implements QueueTransportInterface
     /** @var list<array{string, string}> */
     public static array $published = [];
 
+    public static bool $refuse = false;
+
     public function publish(string $queueName, string $payload): void
     {
+        if (self::$refuse) {
+            throw new \RuntimeException('queue down');
+        }
         self::$published[] = [$queueName, $payload];
     }
 

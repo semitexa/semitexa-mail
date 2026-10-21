@@ -70,7 +70,13 @@ final class SmtpMailTransport implements MailTransportInterface
             fwrite($socket, $data . "\r\n.\r\n");
             $dataResponse = $this->readResponse($socket, 250);
 
-            $this->sendCommand($socket, 'QUIT', 221);
+            // The server has accepted the message: a failing QUIT or a dropped
+            // connection now is not a failed delivery. Counted as one, the
+            // worker sent it again and the recipient got it twice.
+            try {
+                $this->sendCommand($socket, 'QUIT', 221);
+            } catch (\Throwable) {
+            }
 
             return new MailTransportResult(
                 status: MailTransportStatus::Accepted,

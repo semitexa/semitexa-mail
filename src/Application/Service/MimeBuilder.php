@@ -130,20 +130,53 @@ final class MimeBuilder
 
     private function buildAttachmentPart(ResolvedAttachment $attachment): string
     {
-        $out = "Content-Type: {$attachment->mimeType}; name=\"{$attachment->filename}\"\r\n";
+        // File name, type and Content-ID went into the headers as given: a
+        // name with a quote and a line break added headers of its own.
+        $token = '[A-Za-z0-9!#$%&\'*+.^_`|~-]+';
+        $mimeType = preg_match("@^{$token}/{$token}(\\s*;\\s*{$token}=({$token}|\"[^\"\\r\\n]*\"))*$@", $attachment->mimeType) === 1
+            ? $attachment->mimeType
+            : 'application/octet-stream';
+        // Only what could end the header or the angle brackets goes: the
+        // HTML's cid: reference must still match.
+        $contentId = $attachment->contentId !== null ? preg_replace('/[\x00-\x20\x7F<>]/', '', $attachment->contentId) : null;
+
+        $out = "Content-Type: {$mimeType}; " . self::fileParameter('name', $attachment->filename) . "\r\n";
         $out .= "Content-Transfer-Encoding: base64\r\n";
 
-        if ($attachment->disposition === 'inline' && $attachment->contentId !== null) {
-            $out .= "Content-Disposition: inline; filename=\"{$attachment->filename}\"\r\n";
-            $out .= "Content-ID: <{$attachment->contentId}>\r\n";
+        if ($attachment->disposition === 'inline' && $contentId !== null && $contentId !== '') {
+            $out .= 'Content-Disposition: inline; ' . self::fileParameter('filename', $attachment->filename) . "\r\n";
+            $out .= "Content-ID: <{$contentId}>\r\n";
         } else {
-            $out .= "Content-Disposition: attachment; filename=\"{$attachment->filename}\"\r\n";
+            $out .= 'Content-Disposition: attachment; ' . self::fileParameter('filename', $attachment->filename) . "\r\n";
         }
 
         $out .= "\r\n";
         $out .= chunk_split(base64_encode($attachment->contents), 76, "\r\n");
 
         return $out;
+    }
+
+    /**
+     * A quoted file-name parameter: control characters dropped, quote and
+     * backslash escaped, and a non-ASCII name also given RFC 2231-encoded.
+     */
+    private static function fileParameter(string $param, string $filename): string
+    {
+        $clean = (string) preg_replace('/[\x00-\x1F\x7F]/', '', $filename);
+        // Long enough for any real name, short enough that both forms stay
+        // well inside the 998-octet line limit (no RFC 2231 continuations).
+        if (mb_strlen($clean, 'UTF-8') > 80) {
+            $extension = pathinfo($clean, PATHINFO_EXTENSION);
+            $keep = $extension !== '' && mb_strlen($extension, 'UTF-8') <= 10 ? '.' . $extension : '';
+            $clean = mb_substr($clean, 0, 80 - mb_strlen($keep, 'UTF-8'), 'UTF-8') . $keep;
+        }
+        // One underscore per character, not per byte, where it is UTF-8.
+        $ascii = (string) (preg_replace('/[^\x20-\x7E]/u', '_', $clean) ?? preg_replace('/[^\x20-\x7E]/', '_', $clean));
+        $quoted = $param . '="' . addcslashes($ascii, '"\\') . '"';
+
+        return $ascii === $clean
+            ? $quoted
+            : $quoted . '; ' . $param . "*=UTF-8''" . rawurlencode($clean);
     }
 
     /**
