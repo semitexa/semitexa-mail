@@ -34,10 +34,17 @@ class MailMessageRepository implements MailRepositoryInterface
         return $this->system()->findById($id);
     }
 
-    public function findByIdempotencyKey(string $tenantId, string $idempotencyKey): ?MailMessage
+    public function findByIdempotencyKey(?string $tenantId, string $idempotencyKey): ?MailMessage
     {
+        // System mail (no tenant) is looked up among the rows with no tenant:
+        // it was never looked up, and the unique index cannot catch a repeat
+        // either, since it lets any number of NULL tenants through.
+        $query = $tenantId === null
+            ? $this->system()->query()->whereNull(MailMessageResource::column('tenant_id'))
+            : $this->repository()->forTenant($tenantId)->query();
+
         /** @var MailMessage|null */
-        return $this->repository()->forTenant($tenantId)->query()
+        return $query
             ->where(MailMessageResource::column('idempotency_key'), Operator::Equals, $idempotencyKey)
             ->fetchOneAs(MailMessage::class, $this->orm()->getMapperRegistry());
     }

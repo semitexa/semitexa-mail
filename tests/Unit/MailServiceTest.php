@@ -117,6 +117,90 @@ final class MailServiceTest extends TestCase
     }
 
     #[Test]
+    public function a_failed_mail_sent_again_under_its_key_is_retried_from_its_row(): void
+    {
+        // It inserted a second row, the unique index refused it, and send()
+        // threw: a failed mail could not be retried under its key.
+        MailTransportRegistry::register(new MailServiceScriptedTransport(new MailTransportResult(status: MailTransportStatus::Rejected, errorCode: 'mailbox_full', errorMessage: '552 mailbox full')));
+        $envelope = $this->envelope(subject: 'Receipt', text: 'Paid');
+        $envelope->tenantId = 't-1';
+        $envelope->idempotencyKey = 'order-42-receipt';
+
+        $failed = $this->service(driver: 'scripted')->send($envelope, $this->now());
+        $retried = $this->service()->send(clone $envelope, $this->now());
+
+        self::assertSame(MailDispatchStatus::Failed, $failed->status);
+        self::assertSame(MailDispatchStatus::Sent, $retried->status);
+        self::assertSame($failed->messageId, $retried->messageId, 'the same row, not a second one');
+        self::assertSame(1, $this->fake->count());
+        self::assertSame('sent', $this->messages->byId($retried->messageId)?->getStatus());
+    }
+
+    #[Test]
+    public function a_mail_the_server_refused_for_good_is_not_sent_again_under_its_key(): void
+    {
+        MailTransportRegistry::register(new MailServiceScriptedTransport(new MailTransportResult(status: MailTransportStatus::Failed, errorCode: 'invalid_recipient', errorMessage: '550 no such user')));
+        $envelope = $this->envelope(subject: 'Receipt', text: 'Paid');
+        $envelope->idempotencyKey = 'order-43-receipt';
+
+        $first = $this->service(driver: 'scripted')->send($envelope, $this->now());
+        $again = $this->service()->send(clone $envelope, $this->now());
+
+        self::assertSame(MailDispatchStatus::Failed, $again->status);
+        self::assertSame('invalid_recipient', $again->errorCode);
+        self::assertSame($first->messageId, $again->messageId);
+        self::assertSame(0, $this->fake->count(), 'a refused address is refused again');
+    }
+
+    #[Test]
+    public function a_deferred_mail_already_has_its_retry_and_is_not_sent_again(): void
+    {
+        // Sent again, it started a second retry chain beside the queued one.
+        MailTransportRegistry::register(new MailServiceScriptedTransport(new MailTransportResult(status: MailTransportStatus::Deferred, errorCode: 'provider_4xx', errorMessage: '451 try later')));
+        $envelope = $this->envelope(subject: 'Receipt', text: 'Paid');
+        $envelope->idempotencyKey = 'order-44-receipt';
+
+        $this->service(driver: 'scripted')->send($envelope, $this->now());
+        $again = $this->service()->send(clone $envelope, $this->now());
+
+        self::assertSame(MailDispatchStatus::Queued, $again->status);
+        self::assertSame(0, $this->fake->count());
+    }
+
+    #[Test]
+    public function a_resent_mail_carries_its_stored_attachments_not_the_new_envelopes(): void
+    {
+        MailTransportRegistry::register(new MailServiceScriptedTransport(new MailTransportResult(status: MailTransportStatus::Failed, errorCode: 'network_error', errorMessage: 'refused')));
+        $envelope = $this->envelope(subject: 'Invoice', text: 'Attached');
+        $envelope->idempotencyKey = 'invoice-7';
+        $envelope->attachments = [new \Semitexa\Mail\Domain\Model\AttachmentReference('invoice.pdf', 'application/pdf', inlineContents: '%PDF-1.4')];
+
+        $this->service(driver: 'scripted')->send($envelope, $this->now());
+        $recovery = clone $envelope;
+        $recovery->attachments = [];
+        $this->service()->send($recovery, $this->now());
+
+        $sent = $this->fake->getLastMessage();
+        self::assertNotNull($sent);
+        self::assertCount(1, $sent->attachments, 'the PDF the row lists is still attached');
+    }
+
+    #[Test]
+    public function system_mail_with_a_key_sends_once_too(): void
+    {
+        // Without a tenant the key was never looked up.
+        $envelope = $this->envelope(subject: 'Digest', text: 'x');
+        $envelope->idempotencyKey = 'digest-2026-10-21';
+
+        $one = $this->service()->send($envelope, $this->now());
+        $two = $this->service()->send(clone $envelope, $this->now());
+
+        self::assertSame(1, $this->fake->count());
+        self::assertSame($one->messageId, $two->messageId);
+        self::assertSame(MailDispatchStatus::Sent, $two->status, 'a sent mail answers sent, not queued');
+    }
+
+    #[Test]
     public function a_queued_send_publishes_the_message_and_does_not_deliver_yet(): void
     {
         $this->spyOnTheQueue();
@@ -331,7 +415,7 @@ final class MailServiceMessages implements MailRepositoryInterface
         return $this->byId[(string) $id] ?? null;
     }
 
-    public function findByIdempotencyKey(string $tenantId, string $idempotencyKey): ?MailMessage
+    public function findByIdempotencyKey(?string $tenantId, string $idempotencyKey): ?MailMessage
     {
         foreach ($this->byId as $message) {
             if ($message->getTenantId() === $tenantId && $message->getIdempotencyKey() === $idempotencyKey) {

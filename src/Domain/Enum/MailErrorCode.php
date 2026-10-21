@@ -25,7 +25,10 @@ enum MailErrorCode: string
             self::NetworkError,
             self::Timeout,
             self::RateLimited,
-            self::Provider5xx => true,
+            // SMTP replies (the only transport that produces these): a 4xx is
+            // temporary (greylisting answers 450/451), a 5xx permanent. It was
+            // the other way round, as for an HTTP API.
+            self::Provider4xx => true,
             default => false,
         };
     }

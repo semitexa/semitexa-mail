@@ -109,7 +109,7 @@ final class MailWorker
         // Reconstruct attachment references from stored JSON
         $attachmentRefs = [];
         foreach ($mailMessage->getAttachments() as $raw) {
-            $attachmentRefs[] = $this->deserializeAttachment($raw);
+            $attachmentRefs[] = AttachmentReference::fromStored($raw);
         }
 
         // Resolve attachment contents
@@ -232,26 +232,6 @@ final class MailWorker
     // -------------------------------------------------------------------------
     // Helpers
     // -------------------------------------------------------------------------
-
-    /**
-     * @param array<string, mixed> $data
-     */
-    private function deserializeAttachment(array $data): AttachmentReference
-    {
-        $inlineContents = isset($data['inlineContentsBase64'])
-            ? base64_decode($data['inlineContentsBase64'], true) ?: null
-            : null;
-
-        return new AttachmentReference(
-            filename:       $data['filename'] ?? 'attachment',
-            mimeType:       $data['mimeType'] ?? 'application/octet-stream',
-            disposition:    $data['disposition'] ?? 'attachment',
-            contentId:      $data['contentId'] ?? null,
-            storagePath:    $data['storagePath'] ?? null,
-            inlineContents: $inlineContents,
-            sizeHint:       $data['sizeHint'] ?? null,
-        );
-    }
 
     /**
      * @param list<array{email: string, name?: string|null}> $data

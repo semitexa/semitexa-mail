@@ -208,6 +208,23 @@ final class TwigMailTemplateRendererTest extends TestCase
     }
 
     #[Test]
+    public function a_subject_and_a_text_body_are_not_html_escaped(): void
+    {
+        // "O'Brien" arrived as "O&#039;Brien" in the subject.
+        $this->templates([
+            'mail/welcome.subject.txt.twig' => 'Welcome, {{ name }}',
+            'mail/welcome.body.html.twig' => '<p>Hi {{ name }}</p>',
+            'mail/welcome.body.txt.twig' => 'Hi {{ name }}',
+        ]);
+
+        $rendered = (new TwigMailTemplateRenderer())->render('welcome', ['name' => "O'Brien <ob@example.com>"]);
+
+        self::assertSame("Welcome, O'Brien <ob@example.com>", $rendered['subject']);
+        self::assertSame("Hi O'Brien <ob@example.com>", $rendered['textBody']);
+        self::assertSame('<p>Hi O&#039;Brien &lt;ob@example.com&gt;</p>', $rendered['htmlBody'], 'the HTML body is still escaped');
+    }
+
+    #[Test]
     public function without_a_text_template_the_text_body_is_derived_from_the_html(): void
     {
         $this->templates([
@@ -341,7 +358,8 @@ final class TwigMailTemplateRendererTest extends TestCase
         $loader = new ArrayLoader($templates);
         $catalog = new ModuleTemplateCatalog();
         $reflection = new \ReflectionClass($catalog);
-        $twig = new TwigEnvironment($loader, ['cache' => false, 'autoescape' => 'html']);
+        // As ModuleTemplateCatalog sets it: escaping by extension.
+        $twig = new TwigEnvironment($loader, ['cache' => false, 'autoescape' => 'name']);
         // The framework's own trans() and locale(), as the catalog registers them.
         $locale = new LocaleTwigExtension();
         $twig->addFunction(new TwigFunction('trans', $locale->translate(...)));

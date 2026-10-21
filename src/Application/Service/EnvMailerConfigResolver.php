@@ -25,6 +25,7 @@ final class EnvMailerConfigResolver implements MailerConfigResolverInterface
             replyTo:        $this->envOrNull('MAIL_REPLY_TO'),
             timeoutSeconds: (int) $this->env('MAIL_TIMEOUT', '30'),
             queue:          $this->env('MAIL_QUEUE', 'mail'),
+            verifyPeer:     !in_array(strtolower($this->env('MAIL_VERIFY_PEER', 'true')), ['0', 'false', 'no', 'off'], true),
         );
     }
 

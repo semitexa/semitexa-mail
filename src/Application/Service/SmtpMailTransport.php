@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Semitexa\Mail\Application\Service;
 
+use Semitexa\Mail\Exception\MailTlsException;
 use Semitexa\Mail\Exception\SmtpException;
 
 use Semitexa\Mail\Domain\Contract\MailTransportInterface;
@@ -39,7 +40,11 @@ final class SmtpMailTransport implements MailTransportInterface
 
             if ($config->encryption === 'tls') {
                 $this->sendCommand($socket, 'STARTTLS', 220);
-                stream_socket_enable_crypto($socket, true, STREAM_CRYPTO_METHOD_TLSv1_2_CLIENT | STREAM_CRYPTO_METHOD_TLSv1_3_CLIENT);
+                // A failed handshake left the connection in plain text, and
+                // AUTH went out over it.
+                if (@stream_socket_enable_crypto($socket, true, STREAM_CRYPTO_METHOD_TLSv1_2_CLIENT | STREAM_CRYPTO_METHOD_TLSv1_3_CLIENT) !== true) {
+                    throw new MailTlsException("STARTTLS with {$config->host} failed: " . (error_get_last()['message'] ?? 'certificate not trusted, or no common TLS version'));
+                }
                 $this->sendEhlo($socket, $config);
             }
 
@@ -76,10 +81,18 @@ final class SmtpMailTransport implements MailTransportInterface
         } catch (SmtpException $e) {
             $errorCode = $this->classifySmtpError($e);
             return new MailTransportResult(
-                status: $errorCode->isRetryable() ? MailTransportStatus::Deferred : MailTransportStatus::Failed,
+                status: self::isTemporary($e->smtpCode) ? MailTransportStatus::Deferred : MailTransportStatus::Failed,
                 errorCode: $errorCode->value,
                 errorMessage: $e->getMessage(),
                 providerResponse: ['smtp_code' => $e->smtpCode, 'smtp_response' => $e->smtpResponse],
+            );
+        } catch (MailTlsException $e) {
+            // Not network_error: the worker retries that, and a certificate
+            // problem was retried four times, a minute apart.
+            return new MailTransportResult(
+                status: MailTransportStatus::Failed,
+                errorCode: MailErrorCode::ConfigError->value,
+                errorMessage: $e->getMessage(),
             );
         } catch (\Throwable $e) {
             return new MailTransportResult(
@@ -102,10 +115,14 @@ final class SmtpMailTransport implements MailTransportInterface
         $protocol = $config->encryption === 'ssl' ? 'ssl' : 'tcp';
         $address = "{$protocol}://{$config->host}:{$config->port}";
 
+        // Certificates are checked: with checking off, anyone on the path
+        // could read the mail and the AUTH password. MAIL_VERIFY_PEER=false
+        // is for a local test server with a self-signed certificate.
         $context = stream_context_create(['ssl' => [
-            'verify_peer' => false,
-            'verify_peer_name' => false,
-            'allow_self_signed' => true,
+            'verify_peer' => $config->verifyPeer,
+            'verify_peer_name' => $config->verifyPeer,
+            'allow_self_signed' => !$config->verifyPeer,
+            'peer_name' => $config->host,
         ]]);
 
         $socket = @stream_socket_client(
@@ -118,7 +135,13 @@ final class SmtpMailTransport implements MailTransportInterface
         );
 
         if ($socket === false) {
-            throw new SmtpException("Connection failed: {$errstr} ({$errno})", 0, '');
+            // With ssl:// a certificate failure reports errno 0 and an empty
+            // errstr; the reason is only in the last PHP warning.
+            $reason = trim($errstr) !== '' ? $errstr : (string) (error_get_last()['message'] ?? '');
+            if ($config->encryption === 'ssl' && preg_match('/ssl|certificate|tls/i', $reason) === 1) {
+                throw new MailTlsException("TLS with {$config->host} failed: {$reason}");
+            }
+            throw new SmtpException("Connection failed: {$reason} ({$errno})", 0, '');
         }
 
         stream_set_timeout($socket, $config->timeoutSeconds);
@@ -181,6 +204,17 @@ final class SmtpMailTransport implements MailTransportInterface
         }
 
         return $response;
+    }
+
+    /**
+     * In SMTP a 4xx reply is temporary (greylisting answers 450/451) and a 5xx
+     * one permanent; 0 is a lost connection. The shared error codes say the
+     * opposite for HTTP providers, which is how greylisted mail failed for
+     * good and a 554 rejection was retried.
+     */
+    public static function isTemporary(int $smtpCode): bool
+    {
+        return $smtpCode === 0 || ($smtpCode >= 400 && $smtpCode < 500);
     }
 
     private function classifySmtpError(SmtpException $e): MailErrorCode

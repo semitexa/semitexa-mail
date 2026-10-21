@@ -8,6 +8,7 @@ use Semitexa\Core\Attribute\InjectAsReadonly;
 use Semitexa\Core\Attribute\SatisfiesServiceContract;
 use Semitexa\Core\Queue\QueueConfig;
 use Semitexa\Core\Queue\QueueTransportRegistry;
+use Semitexa\Orm\Exception\ConstraintViolationException;
 use Semitexa\Mail\Domain\Model\MailAttempt;
 use Semitexa\Mail\Domain\Model\MailMessage;
 use Semitexa\Mail\Domain\Contract\MailAttemptRepositoryInterface;
@@ -62,24 +63,11 @@ final class MailService implements MailServiceInterface
             );
         }
 
-        // Short-circuit on idempotency key when an active job already exists
-        if ($envelope->idempotencyKey !== null && $envelope->tenantId !== null) {
-            $existing = $this->mailRepository->findByIdempotencyKey(
-                $envelope->tenantId,
-                $envelope->idempotencyKey,
-            );
+        // The same key is the same mail: it is never stored twice.
+        if ($envelope->idempotencyKey !== null) {
+            $existing = $this->mailRepository->findByIdempotencyKey($envelope->tenantId, $envelope->idempotencyKey);
             if ($existing !== null) {
-                $activeStatuses = [
-                    MailMessageStatus::Queued->value,
-                    MailMessageStatus::Sending->value,
-                    MailMessageStatus::Sent->value,
-                ];
-                if (in_array($existing->getStatus(), $activeStatuses, true)) {
-                    return new MailDispatchResult(
-                        status:    MailDispatchStatus::Queued,
-                        messageId: $existing->getId(),
-                    );
-                }
+                return $this->again($existing, $envelope, $options, $config);
             }
         }
 
@@ -115,7 +103,8 @@ final class MailService implements MailServiceInterface
         // Persist mail message (rendered bodies stored before queue dispatch).
         // Resources are readonly: save() returns the persisted row (with the
         // engine-generated UUID) — always continue with the RETURNED instance.
-        $mailMessage = $this->mailRepository->save(new MailMessage(
+        try {
+            $mailMessage = $this->mailRepository->save(new MailMessage(
             id: '',
             tenantId: $envelope->tenantId,
             status: MailMessageStatus::Pending->value,
@@ -135,14 +124,59 @@ final class MailService implements MailServiceInterface
             metadata: $envelope->metadata,
             attachments: array_map($this->serializeAttachment(...), $envelope->attachments),
             idempotencyKey: $envelope->idempotencyKey,
-        ));
-        $messageId = $mailMessage->getId();
+            ));
+        } catch (ConstraintViolationException $e) {
+            // A concurrent send() with the same key stored it first.
+            $existing = $envelope->idempotencyKey !== null
+                ? $this->mailRepository->findByIdempotencyKey($envelope->tenantId, $envelope->idempotencyKey)
+                : null;
+            if ($existing === null) {
+                throw $e;
+            }
 
-        if ($options->mode === MailSendMode::Queued && !$this->queueIsProcessLocal()) {
-            return $this->dispatchToQueue($mailMessage, $messageId, $config->queue);
+            return $this->again($existing, $envelope, $options, $config);
         }
 
-        return $this->sendSync($mailMessage, $messageId, $envelope->attachments, $config);
+        return $this->deliverOrQueue($mailMessage, $options, $config);
+    }
+
+    /**
+     * A send() whose key is already stored. Sent answers sent and one still on
+     * its way answers queued; one that failed, was deferred or never reached
+     * the queue is sent again from its stored row. It used to insert a second
+     * row, which the unique index refused, and send() threw: a failed mail
+     * could not be retried under its key.
+     */
+    private function again(MailMessage $existing, MailEnvelope $envelope, MailSendOptions $options, MailerConfig $config): MailDispatchResult
+    {
+        $id = $existing->getId();
+
+        return match ($existing->getStatus()) {
+            MailMessageStatus::Sent->value => new MailDispatchResult(status: MailDispatchStatus::Sent, messageId: $id),
+            // Deferred has a retry on the queue already: another one would
+            // run a second chain, and two workers would both deliver.
+            MailMessageStatus::Pending->value,
+            MailMessageStatus::Queued->value,
+            MailMessageStatus::Sending->value,
+            MailMessageStatus::Deferred->value => new MailDispatchResult(status: MailDispatchStatus::Queued, messageId: $id),
+            default => in_array($existing->getErrorCode(), [MailErrorCode::InvalidRecipient->value, MailErrorCode::Provider5xx->value], true)
+                // Refused for good by the server: sending it again is refused again.
+                ? new MailDispatchResult(status: MailDispatchStatus::Failed, messageId: $id, errorCode: $existing->getErrorCode(), errorMessage: $existing->getErrorMessage())
+                : $this->deliverOrQueue($existing->with(['errorCode' => null, 'errorMessage' => null]), $options, $config),
+        };
+    }
+
+    private function deliverOrQueue(MailMessage $mailMessage, MailSendOptions $options, MailerConfig $config): MailDispatchResult
+    {
+        if ($options->mode === MailSendMode::Queued && !$this->queueIsProcessLocal()) {
+            return $this->dispatchToQueue($mailMessage, $mailMessage->getId(), $config->queue);
+        }
+
+        // The stored attachments, as the worker reads them: a re-send carries
+        // the row's, not whatever the new envelope holds.
+        $attachments = array_map(AttachmentReference::fromStored(...), $mailMessage->getAttachments());
+
+        return $this->sendSync($mailMessage, $mailMessage->getId(), $attachments, $config);
     }
 
     /**
@@ -167,11 +201,12 @@ final class MailService implements MailServiceInterface
         try {
             $transport    = QueueTransportRegistry::create(QueueConfig::defaultTransport());
             $queueMessage = new QueuedMailMessage(messageId: $messageId);
-            $transport->publish($queueName, $queueMessage->toJson());
-
-            $this->mailRepository->save($mailMessage->with([
+            // Queued before the publish: saved after, it could overwrite the
+            // `sent` a fast worker had already written.
+            $mailMessage = $this->mailRepository->save($mailMessage->with([
                 'status' => MailMessageStatus::Queued->value,
             ]));
+            $transport->publish($queueName, $queueMessage->toJson());
 
             return new MailDispatchResult(
                 status:    MailDispatchStatus::Queued,

@@ -10,7 +10,7 @@ interface MailRepositoryInterface
 {
     public function findById(int|string $id): ?MailMessage;
 
-    public function findByIdempotencyKey(string $tenantId, string $idempotencyKey): ?MailMessage;
+    public function findByIdempotencyKey(?string $tenantId, string $idempotencyKey): ?MailMessage;
 
     /**
      * Persist and RETURN the stored row — resources are readonly, so the

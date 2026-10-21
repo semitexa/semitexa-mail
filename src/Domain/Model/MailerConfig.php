@@ -20,5 +20,7 @@ final readonly class MailerConfig
         public ?string $apiToken = null,
         public int $timeoutSeconds = 30,
         public string $queue = 'mail',
+        /** Check the server's TLS certificate and host name; off only for a local test server. */
+        public bool $verifyPeer = true,
     ) {}
 }
