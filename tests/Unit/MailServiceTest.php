@@ -18,6 +18,7 @@ use Semitexa\Mail\Application\Service\MailTransportRegistry;
 use Semitexa\Mail\Application\Service\MailWorker;
 use Semitexa\Mail\Domain\Contract\MailAttemptRepositoryInterface;
 use Semitexa\Mail\Domain\Contract\MailerConfigResolverInterface;
+use Semitexa\Mail\Domain\Contract\MailRecoveryInterface;
 use Semitexa\Mail\Domain\Contract\MailRepositoryInterface;
 use Semitexa\Mail\Domain\Contract\MailTemplateRendererInterface;
 use Semitexa\Mail\Domain\Contract\MailTransportInterface;
@@ -133,6 +134,42 @@ final class MailServiceTest extends TestCase
         $orm->shutdown();
     }
 
+    /** A claim leaves the row pending, as a held-back mail is: the claimant takes it like any delivery. */
+    #[Test]
+    public function a_claimed_row_taken_by_a_held_back_delivery_first_is_not_sent_by_the_claimant(): void
+    {
+        $this->messages->save(new MailMessage(
+            id: 'receipt-old', tenantId: null, status: 'sending', driver: 'fake', fromEmail: 'noreply@example.test', subject: 'Receipt',
+            to: [['email' => 'ada@example.test', 'name' => 'Ada']], textBody: 'Paid', idempotencyKey: 'receipt-old',
+            updatedAt: new \DateTimeImmutable('-1 hour'),
+        ));
+        // Between the claim and the claimant's delivery, a held-back delivery takes the row.
+        $this->messages->afterClaim = fn (MailServiceMessages $m): bool => $m->takeForDelivery($m->byId('receipt-old'));
+        $envelope = $this->envelope(subject: 'Receipt', text: 'Paid');
+        $envelope->idempotencyKey = 'receipt-old';
+
+        self::assertSame(MailDispatchStatus::Queued, $this->service()->send($envelope, $this->now())->status);
+        self::assertSame(0, $this->fake->count(), 'the held-back delivery sends it, not the claimant');
+    }
+
+    /** A long transaction's mail waits in `pending`; a resend that took it over meanwhile delivered it. */
+    #[Test]
+    public function a_held_back_mail_taken_over_meanwhile_is_not_delivered_again(): void
+    {
+        $orm = new OrmManager(config: new ConnectionConfig(driver: 'sqlite', sqliteMemory: true), connectionName: 'mail_tx_probe');
+        $service = $this->service(orm: $orm);
+
+        $orm->getTransactionManager()->run(function () use ($service): void {
+            $row = $this->messages->byId($service->send($this->envelope(subject: 'Receipt', text: 'Paid'), $this->now())->messageId);
+            self::assertNotNull($row);
+            // What a resend that took the row over leaves behind.
+            $this->messages->save($row->with(['status' => 'sent']));
+        });
+
+        self::assertSame(0, $this->fake->count());
+        $orm->shutdown();
+    }
+
     #[Test]
     public function a_rolled_back_transaction_sends_nothing(): void
     {
@@ -149,6 +186,29 @@ final class MailServiceTest extends TestCase
 
         self::assertSame(0, $this->fake->count());
         $orm->shutdown();
+    }
+
+    /** A crash between storing and delivering left a row that answered Queued for good. */
+    #[Test]
+    public function a_resend_takes_over_a_row_its_sender_abandoned_and_leaves_a_live_one_alone(): void
+    {
+        foreach (['receipt-old' => '-1 hour', 'receipt-live' => '-1 minute'] as $key => $age) {
+            // Stored with an id: a first save through with() stamps the row as changed now.
+            $this->messages->save(new MailMessage(
+                id: $key, tenantId: null, status: 'sending', driver: 'fake', fromEmail: 'noreply@example.test', subject: 'Receipt',
+                to: [['email' => 'ada@example.test', 'name' => 'Ada']], textBody: 'Paid', idempotencyKey: $key,
+                updatedAt: new \DateTimeImmutable($age),
+            ));
+        }
+        $old = $this->envelope(subject: 'Receipt', text: 'Paid');
+        $old->idempotencyKey = 'receipt-old';
+        $live = clone $old;
+        $live->idempotencyKey = 'receipt-live';
+
+        self::assertSame(MailDispatchStatus::Sent, $this->service()->send($old, $this->now())->status);
+        self::assertSame(MailDispatchStatus::Queued, $this->service()->send($live, $this->now())->status, 'a worker may still be on it');
+        self::assertSame(MailDispatchStatus::Sent, $this->service()->send($old, $this->now())->status, 'and it is sent once');
+        self::assertSame(1, $this->fake->count());
     }
 
     #[Test]
@@ -726,7 +786,7 @@ final class MailServiceRenderer implements MailTemplateRendererInterface
     }
 }
 
-final class MailServiceMessages implements MailRepositoryInterface
+final class MailServiceMessages implements MailRepositoryInterface, MailRecoveryInterface
 {
     /** @var array<string, MailMessage> */
     private array $byId = [];
@@ -773,6 +833,34 @@ final class MailServiceMessages implements MailRepositoryInterface
     public int $meanwhileAt = 1;
 
     private int $guardedWrites = 0;
+
+    public function claimAbandoned(MailMessage $message, \DateTimeImmutable $staleBefore): bool
+    {
+        $row = $this->byId[$message->getId()] ?? null;
+        if ($row === null || !in_array($row->getStatus(), ['pending', 'sending'], true) || $row->getUpdatedAt() === null || $row->getUpdatedAt() >= $staleBefore) {
+            return false;
+        }
+        $this->byId[$row->getId()] = $row->with(['status' => 'pending', 'updatedAt' => new \DateTimeImmutable()]);
+        if ($this->afterClaim !== null) {
+            ($this->afterClaim)($this);
+        }
+
+        return true;
+    }
+
+    /** What happens right after a successful claim: another delivery reaching the row. */
+    public ?\Closure $afterClaim = null;
+
+    public function takeForDelivery(MailMessage $message): bool
+    {
+        $row = $this->byId[$message->getId()] ?? null;
+        if ($row?->getStatus() !== 'pending') {
+            return false;
+        }
+        $this->byId[$row->getId()] = $row->with(['status' => 'sending']);
+
+        return true;
+    }
 
     public function saveOutcomeUnlessSent(MailMessage $entity): bool
     {

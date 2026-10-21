@@ -9,6 +9,7 @@ use Semitexa\Core\Attribute\SatisfiesRepositoryContract;
 use Semitexa\Mail\Application\Db\MySQL\Model\MailMessageResource;
 use Semitexa\Mail\Domain\Model\MailMessage;
 use Semitexa\Mail\Domain\Contract\MailRepositoryInterface;
+use Semitexa\Mail\Domain\Contract\MailRecoveryInterface;
 use Semitexa\Mail\Domain\Contract\MailRetentionInterface;
 use Semitexa\Orm\Application\Service\Uuid7;
 use Semitexa\Orm\OrmManager;
@@ -17,7 +18,7 @@ use Semitexa\Orm\Query\SystemScopeToken;
 use Semitexa\Orm\Repository\DomainRepository;
 
 #[SatisfiesRepositoryContract(of: MailRepositoryInterface::class)]
-class MailMessageRepository implements MailRepositoryInterface, MailRetentionInterface
+class MailMessageRepository implements MailRepositoryInterface, MailRetentionInterface, MailRecoveryInterface
 {
     #[InjectAsReadonly]
     protected OrmManager $orm;
@@ -113,6 +114,32 @@ class MailMessageRepository implements MailRepositoryInterface, MailRetentionInt
         $row = $this->orm()->getQueryAdapter()->execute('SELECT status FROM mail_messages WHERE id = :id', ['id' => $id])->rows[0] ?? null;
 
         return $row !== null && $row['status'] !== 'sent';
+    }
+
+    public function claimAbandoned(MailMessage $message, \DateTimeImmutable $staleBefore): bool
+    {
+        $utc = new \DateTimeZone('UTC');
+
+        return $this->orm()->getQueryAdapter()->execute(
+            "UPDATE mail_messages SET status = 'pending', updated_at = :now
+             WHERE id = :id AND status IN ('pending', 'sending') AND updated_at < :stale",
+            [
+                'now' => (new \DateTimeImmutable('now', $utc))->format('Y-m-d H:i:s'),
+                'id' => Uuid7::toBytes($message->getId()),
+                'stale' => $staleBefore->setTimezone($utc)->format('Y-m-d H:i:s'),
+            ],
+        )->rowCount === 1;
+    }
+
+    public function takeForDelivery(MailMessage $message): bool
+    {
+        return $this->orm()->getQueryAdapter()->execute(
+            "UPDATE mail_messages SET status = 'sending', updated_at = :now WHERE id = :id AND status = 'pending'",
+            [
+                'now' => (new \DateTimeImmutable('now', new \DateTimeZone('UTC')))->format('Y-m-d H:i:s'),
+                'id' => Uuid7::toBytes($message->getId()),
+            ],
+        )->rowCount === 1;
     }
 
     public function deleteFinishedBefore(\DateTimeImmutable $cutoff, int $limit): int

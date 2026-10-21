@@ -15,6 +15,7 @@ use Semitexa\Orm\OrmManager;
 use Semitexa\Mail\Domain\Model\MailAttempt;
 use Semitexa\Mail\Domain\Model\MailMessage;
 use Semitexa\Mail\Domain\Contract\MailAttemptRepositoryInterface;
+use Semitexa\Mail\Domain\Contract\MailRecoveryInterface;
 use Semitexa\Mail\Domain\Contract\MailRepositoryInterface;
 use Semitexa\Mail\Domain\Contract\MailServiceInterface;
 use Semitexa\Mail\Domain\Contract\MailTemplateRendererInterface;
@@ -37,6 +38,9 @@ use Semitexa\Mail\Domain\Model\PreparedMailMessage;
 #[SatisfiesServiceContract(of: MailServiceInterface::class)]
 final class MailService implements MailServiceInterface
 {
+    /** How long a pending or sending row may sit before a resend under its key takes it over. */
+    public const int ABANDONED_AFTER_SECONDS = 900;
+
     #[InjectAsReadonly]
     protected MailerConfigResolverInterface $configResolver;
 
@@ -199,8 +203,12 @@ final class MailService implements MailServiceInterface
         return match ($existing->getStatus()) {
             MailMessageStatus::Sent->value => new MailDispatchResult(status: MailDispatchStatus::Sent, messageId: $id),
             MailMessageStatus::Pending->value,
-            MailMessageStatus::Queued->value,
-            MailMessageStatus::Sending->value => new MailDispatchResult(status: MailDispatchStatus::Queued, messageId: $id),
+            MailMessageStatus::Sending->value => $this->claimAbandoned($existing)
+                // Its sender or worker died before delivering it: answered
+                // Queued for good, it was never delivered.
+                ? $this->takeOver($existing->with(['status' => MailMessageStatus::Pending->value]), $options, $config)
+                : new MailDispatchResult(status: MailDispatchStatus::Queued, messageId: $id),
+            MailMessageStatus::Queued->value => new MailDispatchResult(status: MailDispatchStatus::Queued, messageId: $id),
             // Deferred has a retry on the queue already, unless the queue is
             // this process's own: another one would run a second chain, and
             // two workers would both deliver.
@@ -212,6 +220,35 @@ final class MailService implements MailServiceInterface
                 ? new MailDispatchResult(status: MailDispatchStatus::Failed, messageId: $id, errorCode: $existing->getErrorCode(), errorMessage: $existing->getErrorMessage())
                 : $this->deliverOrQueue($existing->with(['errorCode' => null, 'errorMessage' => null]), $options, $config),
         };
+    }
+
+    /**
+     * A pending or sending row untouched for ABANDONED_AFTER_SECONDS: a send
+     * or an SMTP conversation lasts seconds (MAIL_TIMEOUT), so nobody is
+     * delivering it any more. Exactly one resend takes it over.
+     */
+    private function claimAbandoned(MailMessage $row): bool
+    {
+        // The database compares updated_at, in the zone it was written in.
+        return $this->mailRepository instanceof MailRecoveryInterface
+            && $this->mailRepository->claimAbandoned($row, new \DateTimeImmutable('-' . self::ABANDONED_AFTER_SECONDS . ' seconds'));
+    }
+
+    /**
+     * A claimed row is `pending`, as a held-back mail is: delivered at once,
+     * it goes through the same pending → sending step, or a held-back
+     * delivery reaching its turn right after the claim would send it too.
+     */
+    private function takeOver(MailMessage $claimed, MailSendOptions $options, MailerConfig $config): MailDispatchResult
+    {
+        if (isset($this->orm) && $this->orm->getTransactionManager()->isActive()) {
+            return $this->deliverOrQueue($claimed, $options, $config); // takes it after the commit
+        }
+        if ($this->mailRepository instanceof MailRecoveryInterface && !$this->mailRepository->takeForDelivery($claimed)) {
+            return new MailDispatchResult(status: MailDispatchStatus::Queued, messageId: $claimed->getId());
+        }
+
+        return $this->deliverNow($claimed, $options, $config);
     }
 
     /**
@@ -232,6 +269,13 @@ final class MailService implements MailServiceInterface
                 $mailMessage = $this->mailRepository->save($mailMessage->with(['status' => MailMessageStatus::Pending->value]));
             }
             $transaction->afterCommit(function () use ($mailMessage, $options, $config): void {
+                // A long transaction's mails wait in `pending` with the time
+                // they were stored: one older than ABANDONED_AFTER_SECONDS by
+                // the time its turn comes may have been taken over by a
+                // resend, which delivered it.
+                if ($this->mailRepository instanceof MailRecoveryInterface && !$this->mailRepository->takeForDelivery($mailMessage)) {
+                    return;
+                }
                 // The caller was told Queued: a failure now is in the row, and here.
                 $result = $this->deliverNow($mailMessage, $options, $config);
                 if (!$result->succeeded()) {
