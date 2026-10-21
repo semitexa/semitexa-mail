@@ -8,6 +8,7 @@ use Semitexa\Core\Environment;
 use Semitexa\Core\Queue\DelayedQueueTransportInterface;
 use Semitexa\Core\Queue\QueueConfig;
 use Semitexa\Core\Queue\QueueStatsRecorder;
+use Semitexa\Core\Queue\QueueStopSignals;
 use Semitexa\Core\Queue\QueueTransportRegistry;
 use Semitexa\Mail\Domain\Model\MailAttempt;
 use Semitexa\Mail\Domain\Model\MailMessage;
@@ -76,6 +77,7 @@ final class MailWorker
         $this->currentQueue     = $queueName;
 
         $transport = QueueTransportRegistry::create($this->currentTransport);
+        QueueStopSignals::install($transport, fn (string $message) => $this->log($message));
 
         $this->log("Mail worker started (transport={$this->currentTransport}, queue={$this->currentQueue})");
 
