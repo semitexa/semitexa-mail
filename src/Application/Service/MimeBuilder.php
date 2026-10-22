@@ -138,7 +138,8 @@ final class MimeBuilder
         // File name, type and Content-ID went into the headers as given: a
         // name with a quote and a line break added headers of its own.
         $token = '[A-Za-z0-9!#$%&\'*+.^_`|~-]+';
-        $mimeType = preg_match("@^{$token}/{$token}(\\s*;\\s*{$token}=({$token}|\"[^\"\\r\\n]*\"))*$@", $attachment->mimeType) === 1
+        // [ \t], not \s, and D: \s took a line break, and $ a trailing one.
+        $mimeType = preg_match("@^{$token}/{$token}([ \t]*;[ \t]*{$token}=({$token}|\"[^\"\\r\\n]*\"))*$@D", $attachment->mimeType) === 1
             ? $attachment->mimeType
             : 'application/octet-stream';
         // Only what could end the header or the angle brackets goes: the
@@ -189,7 +190,14 @@ final class MimeBuilder
      */
     private function formatRecipientList(array $recipients): string
     {
-        return implode(', ', array_map(fn($r) => $r->formatted(), $recipients));
+        $list = implode(', ', array_map(fn($r) => $r->formatted(), $recipients));
+        // Folded after each comma once it is long: sixty named recipients made
+        // one 2 300-character To: line, past the 998 a line may hold.
+        if (strlen($list) <= 72) {
+            return $list;
+        }
+
+        return implode(",\r\n ", array_map(fn($r) => $r->formatted(), $recipients));
     }
 
     /** @param int $lineUsed length of the "Name: " the value follows */
@@ -197,6 +205,12 @@ final class MimeBuilder
     {
         if (preg_match('/[^\x20-\x7E]/', $value)) {
             return EncodedWord::encode($value, $lineUsed);
+        }
+        // Plain ASCII was never folded: a 2 000-character subject was one
+        // line, past the 998 a line may hold. Folded at spaces, which
+        // unfolding gives back.
+        if ($lineUsed + strlen($value) > 78) {
+            return wordwrap($value, 76, "\r\n ", false);
         }
         return $value;
     }

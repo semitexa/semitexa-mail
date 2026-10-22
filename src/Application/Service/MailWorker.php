@@ -276,23 +276,36 @@ final class MailWorker
         $finishedAt = new \DateTimeImmutable();
         $this->attemptEndedAt = microtime(true);
 
-        // Record attempt
-        $attemptNo               = $this->attemptRepository->countByMessageId($message->messageId) + 1;
-        $this->attemptRepository->save(new MailAttempt(
-            id: '',
-            tenantId: $mailMessage->getTenantId(),
-            mailMessageId: $message->messageId,
-            attemptNo: $attemptNo,
-            driver: $config->driver,
-            status: $result->status->value,
-            startedAt: $startedAt,
-            finishedAt: $finishedAt,
-            providerMessageId: $result->providerMessageId,
-            providerStatus: $result->providerStatus,
-            providerResponse: $result->providerResponse,
-            errorCode: $result->errorCode,
-            errorMessage: $result->errorMessage,
-        ));
+        // The attempt is recorded after the mail's status: written first, a
+        // database error on it (the server gone away) left a delivered mail
+        // `sending`, the queue redelivered it, and it was delivered twice.
+        // Its own failure is only said.
+        $recordAttempt = function () use ($message, $mailMessage, $config, $result, $startedAt, $finishedAt): int {
+            try {
+                $attemptNo = $this->attemptRepository->countByMessageId($message->messageId) + 1;
+                $this->attemptRepository->save(new MailAttempt(
+                    id: '',
+                    tenantId: $mailMessage->getTenantId(),
+                    mailMessageId: $message->messageId,
+                    attemptNo: $attemptNo,
+                    driver: $config->driver,
+                    status: $result->status->value,
+                    startedAt: $startedAt,
+                    finishedAt: $finishedAt,
+                    providerMessageId: $result->providerMessageId,
+                    providerStatus: $result->providerStatus,
+                    providerResponse: $result->providerResponse,
+                    errorCode: $result->errorCode,
+                    errorMessage: $result->errorMessage,
+                ));
+
+                return $attemptNo;
+            } catch (\Throwable $e) {
+                $this->log("The attempt of mail '{$message->messageId}' could not be recorded: {$e->getMessage()}", 'error');
+
+                return 0;
+            }
+        };
 
         if ($result->status === MailTransportStatus::Accepted) {
             $this->mailRepository->save($mailMessage->with([
@@ -301,10 +314,13 @@ final class MailWorker
                 'errorCode' => null,
                 'errorMessage' => null,
             ]));
+            $attemptNo = $recordAttempt();
             $this->outcome = 'processed';
             $this->log("Mail '{$message->messageId}' sent (attempt {$attemptNo}).", 'success');
             return;
         }
+
+        $attemptNo = $recordAttempt();
 
         // Determine retry eligibility
         $errorCode = $result->errorCode !== null

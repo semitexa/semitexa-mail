@@ -421,24 +421,6 @@ final class MailService implements MailServiceInterface
         $result     = $transport->deliver($prepared, $config);
         $finishedAt = new \DateTimeImmutable();
 
-        // Record attempt
-        $attemptNo          = $this->attemptRepository->countByMessageId($messageId) + 1;
-        $this->attemptRepository->save(new MailAttempt(
-            id: '',
-            tenantId: $mailMessage->getTenantId(),
-            mailMessageId: $messageId,
-            attemptNo: $attemptNo,
-            driver: $config->driver,
-            status: $result->status->value,
-            startedAt: $startedAt,
-            finishedAt: $finishedAt,
-            providerMessageId: $result->providerMessageId,
-            providerStatus: $result->providerStatus,
-            providerResponse: $result->providerResponse,
-            errorCode: $result->errorCode,
-            errorMessage: $result->errorMessage,
-        ));
-
         // Update mail message status
         $finalStatus = match ($result->status) {
             MailTransportStatus::Accepted => MailMessageStatus::Sent,
@@ -452,6 +434,30 @@ final class MailService implements MailServiceInterface
             'errorCode' => $result->errorCode,
             'errorMessage' => $result->errorMessage,
         ]));
+
+        // The attempt after the status: written first, a database error on it
+        // (the server gone away) left a delivered mail `sending`, and a resend
+        // took it over and delivered it again. Its own failure is only said.
+        try {
+            $attemptNo          = $this->attemptRepository->countByMessageId($messageId) + 1;
+            $this->attemptRepository->save(new MailAttempt(
+                id: '',
+                tenantId: $mailMessage->getTenantId(),
+                mailMessageId: $messageId,
+                attemptNo: $attemptNo,
+                driver: $config->driver,
+                status: $result->status->value,
+                startedAt: $startedAt,
+                finishedAt: $finishedAt,
+                providerMessageId: $result->providerMessageId,
+                providerStatus: $result->providerStatus,
+                providerResponse: $result->providerResponse,
+                errorCode: $result->errorCode,
+                errorMessage: $result->errorMessage,
+            ));
+        } catch (\Throwable $e) {
+            StaticLoggerBridge::error('mail', "The attempt of mail '{$messageId}' could not be recorded: {$e->getMessage()}", ['status' => $result->status->value]);
+        }
 
         if ($result->status === MailTransportStatus::Accepted) {
             return new MailDispatchResult(

@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Semitexa\Mail\Application\Service;
 
+use Semitexa\Core\Environment;
 use Semitexa\Mail\Exception\MailTlsException;
 use Semitexa\Mail\Exception\SmtpException;
 
@@ -18,6 +19,13 @@ use Semitexa\Mail\Domain\Model\PreparedMailMessage;
 final class SmtpMailTransport implements MailTransportInterface
 {
     private readonly MimeBuilder $mimeBuilder;
+
+    /**
+     * The wait for the reply to the final dot. RFC 5321 gives ten minutes;
+     * a queue's message comes back to another worker after its ack wait
+     * (NATS: 300 s), which would send the mail a second time, so less.
+     */
+    private const FINAL_REPLY_SECONDS = 240;
 
     public function __construct()
     {
@@ -58,6 +66,13 @@ final class SmtpMailTransport implements MailTransportInterface
             }
 
             if ($config->username !== null && $config->password !== null) {
+                // The password went to any host in plain text when
+                // MAIL_ENCRYPTION was empty, its default. A local relay (this
+                // machine, a compose service) is let through; anything else
+                // needs TLS or MAIL_ALLOW_PLAINTEXT_AUTH=1.
+                if ($encryption === null && !self::isLocalRelay($config->host) && !self::plaintextAuthAllowed()) {
+                    throw new MailTlsException("Not signing in to {$config->host} without TLS: the password would cross the network in plain text. Set MAIL_ENCRYPTION=tls (or ssl), or MAIL_ALLOW_PLAINTEXT_AUTH=1 for a trusted network.");
+                }
                 $this->authenticate($socket, $config->username, $config->password, $ehlo);
             }
 
@@ -65,7 +80,14 @@ final class SmtpMailTransport implements MailTransportInterface
 
             $allRecipients = [...$message->to, ...$message->cc, ...$message->bcc];
             foreach ($allRecipients as $recipient) {
-                $this->sendCommand($socket, "RCPT TO:<{$recipient->email}>", 250);
+                try {
+                    $this->sendCommand($socket, "RCPT TO:<{$recipient->email}>", 250);
+                } catch (SmtpException $e) {
+                    // 251, "will forward", is an accepted recipient too.
+                    if ($e->smtpCode !== 251) {
+                        throw $e;
+                    }
+                }
             }
 
             $this->sendCommand($socket, 'DATA', 354);
@@ -75,8 +97,30 @@ final class SmtpMailTransport implements MailTransportInterface
             // Dot-stuffing
             $data = str_replace("\r\n.", "\r\n..", $data);
 
-            fwrite($socket, $data . "\r\n.\r\n");
-            $dataResponse = $this->readResponse($socket, 250);
+            $payload = $data . "\r\n.\r\n";
+            // Cut short, the server never got the final dot: not delivered,
+            // and retried as a network error, not taken for a mail that may be.
+            if (@fwrite($socket, $payload) !== strlen($payload)) {
+                throw new SmtpException('Connection lost while sending the message', 0, '');
+            }
+            // The reply to the final dot can be slow (a content filter): cut
+            // off at MAIL_TIMEOUT, a mail the server then accepted was sent
+            // again. Without any reply the
+            // outcome is unknown, and it is not sent again on its own.
+            stream_set_timeout($socket, max($config->timeoutSeconds, self::FINAL_REPLY_SECONDS));
+            try {
+                $dataResponse = $this->readResponse($socket, 250);
+            } catch (SmtpException $e) {
+                if ($e->smtpCode !== 0) {
+                    throw $e;
+                }
+
+                return new MailTransportResult(
+                    status: MailTransportStatus::Failed,
+                    errorCode: MailErrorCode::UnknownTransportError->value,
+                    errorMessage: "No reply after the message was sent to {$config->host}: it may have been delivered, so it is not sent again. Check the recipient before resending.",
+                );
+            }
 
             // The server has accepted the message: a failing QUIT or a dropped
             // connection now is not a failed delivery. Counted as one, the
@@ -282,6 +326,20 @@ final class SmtpMailTransport implements MailTransportInterface
     public static function isDomain(string $name): bool
     {
         return preg_match('/^(?=.{1,253}$)([A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+[A-Za-z]{2,63}$/', $name) === 1;
+    }
+
+    /** This machine, or a one-word host (a compose service on the same network). */
+    public static function isLocalRelay(string $host): bool
+    {
+        $host = strtolower(trim($host, '[] '));
+
+        return in_array($host, ['localhost', '127.0.0.1', '::1'], true)
+            || (filter_var($host, FILTER_VALIDATE_IP) === false && !str_contains($host, '.'));
+    }
+
+    private static function plaintextAuthAllowed(): bool
+    {
+        return in_array(strtolower(trim((string) Environment::getEnvValue('MAIL_ALLOW_PLAINTEXT_AUTH', ''))), ['1', 'true', 'yes', 'on'], true);
     }
 
     /** PLAIN when the EHLO reply offers PLAIN and not LOGIN, LOGIN otherwise. */

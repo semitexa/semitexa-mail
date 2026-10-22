@@ -199,6 +199,44 @@ final class MailHeaderInjectionTest extends TestCase
         self::assertSame('"Bob \"B\" Smith" <bob@example.com>', (new MailRecipient('bob@example.com', 'Bob "B" Smith'))->formatted());
     }
 
+    /** A 2 000-character subject and sixty named recipients were single lines past the 998 limit. */
+    #[Test]
+    public function long_ascii_headers_are_folded_within_the_line_limit(): void
+    {
+        $message = $this->message();
+        $message->subject = trim(str_repeat('word ', 400));
+        $message->to = array_map(static fn (int $i): MailRecipient => new MailRecipient("user{$i}@example.com", "Recipient Number {$i}"), range(1, 60));
+
+        $headers = (new MimeBuilder())->build($message)['headers'];
+
+        foreach (explode("\r\n", $headers) as $line) {
+            self::assertLessThanOrEqual(998, strlen($line));
+        }
+        $unfolded = (string) preg_replace("/\r\n[ \t]/", ' ', $headers);
+        self::assertStringContainsString('Subject: ' . $message->subject . "\r\n", $unfolded . "\r\n");
+        self::assertStringContainsString('<user60@example.com>', $headers);
+    }
+
+    #[Test]
+    public function a_local_relay_is_this_machine_or_a_one_word_host(): void
+    {
+        foreach (['localhost', '127.0.0.1', '::1', 'mailpit', 'smtp'] as $host) {
+            self::assertTrue(\Semitexa\Mail\Application\Service\SmtpMailTransport::isLocalRelay($host), $host);
+        }
+        foreach (['smtp.example.com', '203.0.113.5', 'mail.internal'] as $host) {
+            self::assertFalse(\Semitexa\Mail\Application\Service\SmtpMailTransport::isLocalRelay($host), $host);
+        }
+    }
+
+    /** `?: null` turned the contents "0" into no attachment at all. */
+    #[Test]
+    public function an_attachment_whose_contents_are_zero_is_kept(): void
+    {
+        $ref = \Semitexa\Mail\Domain\Model\AttachmentReference::fromStored(['filename' => 'zero.txt', 'inlineContentsBase64' => base64_encode('0')]);
+
+        self::assertSame('0', $ref->inlineContents);
+    }
+
     private function message(): PreparedMailMessage
     {
         $message = new PreparedMailMessage();

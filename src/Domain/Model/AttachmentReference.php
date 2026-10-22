@@ -26,9 +26,12 @@ final readonly class AttachmentReference
      */
     public static function fromStored(array $data): self
     {
-        $inline = isset($data['inlineContentsBase64']) && is_string($data['inlineContentsBase64'])
-            ? (base64_decode($data['inlineContentsBase64'], true) ?: null)
-            : null;
+        // `=== false`, not `?:`: an attachment whose contents are "0" or empty
+        // decoded to a falsy string, became null, and was "missing".
+        $decoded = isset($data['inlineContentsBase64']) && is_string($data['inlineContentsBase64'])
+            ? base64_decode($data['inlineContentsBase64'], true)
+            : false;
+        $inline = $decoded === false ? null : $decoded;
 
         return new self(
             filename:       is_string($data['filename'] ?? null) ? $data['filename'] : 'attachment',
