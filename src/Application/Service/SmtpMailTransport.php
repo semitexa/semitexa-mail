@@ -56,7 +56,18 @@ final class SmtpMailTransport implements MailTransportInterface
             $ehlo = $this->sendEhlo($socket);
 
             if ($encryption === 'tls') {
-                $this->sendCommand($socket, 'STARTTLS', 220);
+                try {
+                    $this->sendCommand($socket, 'STARTTLS', 220);
+                } catch (SmtpException $e) {
+                    // A server that does not offer STARTTLS (502) answered
+                    // provider_5xx, which again() takes for a mail refused for
+                    // good: after MAIL_ENCRYPTION was fixed, it was never sent.
+                    // A setup problem; a temporary 454 stays deferred.
+                    if ($e->smtpCode >= 500) {
+                        throw new MailTlsException("{$config->host} refused STARTTLS ({$e->smtpCode} " . trim((string) $e->smtpResponse) . "): it does not offer it on this port, or cannot start TLS. Use MAIL_ENCRYPTION=ssl (port 465) or the server's STARTTLS port.", 0, $e);
+                    }
+                    throw $e;
+                }
                 // A failed handshake left the connection in plain text, and
                 // AUTH went out over it.
                 if (@stream_socket_enable_crypto($socket, true, STREAM_CRYPTO_METHOD_TLSv1_2_CLIENT | STREAM_CRYPTO_METHOD_TLSv1_3_CLIENT) !== true) {

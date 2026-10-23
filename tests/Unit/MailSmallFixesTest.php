@@ -123,4 +123,44 @@ final class MailSmallFixesTest extends TestCase
         self::assertSame('LOGIN', \Semitexa\Mail\Application\Service\SmtpMailTransport::authMechanism("250-mail.example\r\n250 AUTH LOGIN\r\n"));
         self::assertSame('LOGIN', \Semitexa\Mail\Application\Service\SmtpMailTransport::authMechanism(''));
     }
+
+    /**
+     * A server without STARTTLS answers 502: it was provider_5xx, which a
+     * resend under the mail's key takes for refused for good, so the mail was
+     * never sent after MAIL_ENCRYPTION was fixed. A temporary 454 stays deferred.
+     */
+    #[Test]
+    public function a_starttls_the_server_does_not_offer_is_a_config_error_and_a_temporary_refusal_is_deferred(): void
+    {
+        foreach (['502 5.5.1 STARTTLS not supported' => ['failed', 'config_error'], '454 4.7.0 TLS not available' => ['deferred', 'provider_4xx']] as $reply => [$status, $code]) {
+            [$process, $port] = self::smtpServerAnsweringStarttls($reply);
+            try {
+                $result = (new \Semitexa\Mail\Application\Service\SmtpMailTransport())->deliver(
+                    $this->message(),
+                    new \Semitexa\Mail\Domain\Model\MailerConfig(host: '127.0.0.1', port: $port, encryption: 'tls', timeoutSeconds: 5),
+                );
+            } finally {
+                proc_terminate($process);
+                proc_close($process);
+            }
+            self::assertSame($status, $result->status->value, $reply);
+            self::assertSame($code, $result->errorCode, $reply);
+        }
+    }
+
+    /** @return array{resource, int} a one-connection SMTP server: greets, answers EHLO, then $reply to STARTTLS */
+    private static function smtpServerAnsweringStarttls(string $reply): array
+    {
+        $script = '$s = stream_socket_server("tcp://127.0.0.1:0"); fwrite(STDOUT, stream_socket_get_name($s, false) . "\n"); fflush(STDOUT);'
+            . '$c = stream_socket_accept($s, 10); fwrite($c, "220 test ESMTP\r\n");'
+            . 'while (($l = fgets($c)) !== false) { $l = strtoupper(trim($l));'
+            . 'if (str_starts_with($l, "EHLO")) { fwrite($c, "250-test\r\n250 STARTTLS\r\n"); }'
+            . 'elseif ($l === "STARTTLS") { fwrite($c, ' . var_export($reply . "\r\n", true) . '); }'
+            . 'elseif ($l === "QUIT") { fwrite($c, "221 bye\r\n"); break; } else { fwrite($c, "500 what\r\n"); } }';
+        $process = proc_open([PHP_BINARY, '-r', $script], [1 => ['pipe', 'w'], 2 => ['pipe', 'w']], $pipes);
+        self::assertIsResource($process);
+        $address = trim((string) fgets($pipes[1]));
+
+        return [$process, (int) substr($address, strrpos($address, ':') + 1)];
+    }
 }
