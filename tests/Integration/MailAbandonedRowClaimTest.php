@@ -76,6 +76,26 @@ final class MailAbandonedRowClaimTest extends TestCase
         self::assertFalse($repository->takeForDelivery($sent));
     }
 
+    /**
+     * A redelivery while the first worker was still sending moved the row to
+     * `sending` again and delivered the mail twice: one worker at a time.
+     */
+    #[Test]
+    public function one_worker_at_a_time_moves_a_mail_to_sending(): void
+    {
+        $repository = new MailMessageRepository();
+        $queued = $this->stored($repository, 'queued', null);
+        $abandoned = $this->stored($repository, 'sending', '2001-01-01 00:00:00');
+        $sent = $this->stored($repository, 'sent', null);
+        $cutoff = new \DateTimeImmutable('-15 minutes');
+
+        self::assertTrue($repository->claimForSending($queued, $cutoff));
+        self::assertSame('sending', $repository->findById($queued->getId())?->getStatus());
+        self::assertFalse($repository->claimForSending($queued, $cutoff), 'another worker is on it');
+        self::assertTrue($repository->claimForSending($abandoned, $cutoff), 'a worker that died is taken over');
+        self::assertFalse($repository->claimForSending($sent, $cutoff));
+    }
+
     private function stored(MailMessageRepository $repository, string $status, ?string $updatedAt): MailMessage
     {
         $row = $repository->save(new MailMessage(

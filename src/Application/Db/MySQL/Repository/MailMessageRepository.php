@@ -10,6 +10,7 @@ use Semitexa\Mail\Application\Db\MySQL\Model\MailMessageResource;
 use Semitexa\Mail\Domain\Model\MailMessage;
 use Semitexa\Mail\Domain\Contract\MailRepositoryInterface;
 use Semitexa\Mail\Domain\Contract\MailRecoveryInterface;
+use Semitexa\Mail\Domain\Contract\MailSendingClaimInterface;
 use Semitexa\Mail\Domain\Contract\MailRetentionInterface;
 use Semitexa\Orm\Application\Service\Uuid7;
 use Semitexa\Orm\OrmManager;
@@ -18,7 +19,7 @@ use Semitexa\Orm\Query\SystemScopeToken;
 use Semitexa\Orm\Repository\DomainRepository;
 
 #[SatisfiesRepositoryContract(of: MailRepositoryInterface::class)]
-class MailMessageRepository implements MailRepositoryInterface, MailRetentionInterface, MailRecoveryInterface
+class MailMessageRepository implements MailRepositoryInterface, MailRetentionInterface, MailRecoveryInterface, MailSendingClaimInterface
 {
     #[InjectAsReadonly]
     protected OrmManager $orm;
@@ -127,6 +128,23 @@ class MailMessageRepository implements MailRepositoryInterface, MailRetentionInt
                 'now' => (new \DateTimeImmutable('now', $utc))->format('Y-m-d H:i:s'),
                 'id' => Uuid7::toBytes($message->getId()),
                 'stale' => $staleBefore->setTimezone($utc)->format('Y-m-d H:i:s'),
+            ],
+        )->rowCount === 1;
+    }
+
+    public function claimForSending(MailMessage $message, \DateTimeImmutable $staleBefore): bool
+    {
+        $utc = new \DateTimeZone('UTC');
+        $now = (new \DateTimeImmutable('now', $utc))->format('Y-m-d H:i:s');
+
+        return $this->orm()->getQueryAdapter()->execute(
+            "UPDATE mail_messages SET status = 'sending', last_attempt_at = :now_attempt, updated_at = :now
+             WHERE id = :id AND status <> 'sent' AND (status <> 'sending' OR updated_at < :stale)",
+            [
+                'now_attempt' => $now,
+                'now' => $now,
+                'stale' => $staleBefore->setTimezone($utc)->format('Y-m-d H:i:s'),
+                'id' => Uuid7::toBytes($message->getId()),
             ],
         )->rowCount === 1;
     }

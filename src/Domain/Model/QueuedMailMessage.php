@@ -14,6 +14,12 @@ final class QueuedMailMessage implements \JsonSerializable
         public int $attempts = 0,
         public int $maxRetries = 3,
         public int $retryDelay = 60,
+        /**
+         * A copy made while another worker held the mail: it only takes over
+         * a row still `sending` (that worker died), and stops at any other
+         * status — a `deferred` or `failed` it ended with is not sent again.
+         */
+        public bool $takeoverOnly = false,
     ) {
         $this->queuedAt = $queuedAt ?: date(DATE_ATOM);
     }
@@ -27,6 +33,7 @@ final class QueuedMailMessage implements \JsonSerializable
             'attempts'   => $this->attempts,
             'maxRetries' => $this->maxRetries,
             'retryDelay' => $this->retryDelay,
+            'takeoverOnly' => $this->takeoverOnly,
         ];
     }
 
@@ -45,6 +52,7 @@ final class QueuedMailMessage implements \JsonSerializable
             attempts:   $data['attempts'] ?? 0,
             maxRetries: $data['maxRetries'] ?? 3,
             retryDelay: $data['retryDelay'] ?? 60,
+            takeoverOnly: ($data['takeoverOnly'] ?? false) === true,
         );
     }
 }

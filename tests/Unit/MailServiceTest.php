@@ -514,6 +514,47 @@ final class MailServiceTest extends TestCase
         self::assertGreaterThan(time() - 30, strtotime($again->queuedAt), 'queuedAt kept, so the looking stops');
     }
 
+    /**
+     * A redelivery while another worker is on the mail — or was, and died —
+     * was acknowledged as "being sent", and a crashed worker's mail was lost.
+     * It is looked at again once that worker would be presumed dead.
+     */
+    #[Test]
+    public function a_mail_another_worker_holds_is_looked_at_again_after_the_takeover_window(): void
+    {
+        QueueTransportRegistry::register('mail-test-delayed', new class implements \Semitexa\Core\Queue\QueueTransportFactoryInterface {
+            public function create(): \Semitexa\Core\Queue\QueueTransportInterface
+            {
+                return new MailServiceDelayedQueueSpy();
+            }
+        });
+        putenv('EVENTS_TRANSPORT=mail-test-delayed');
+        MailServiceDelayedQueueSpy::$delayed = [];
+        $id = $this->queuedMessage();
+        $this->messages->heldByAnotherWorker[$id] = true;
+
+        $this->worker()->processPayload((new QueuedMailMessage(messageId: $id))->toJson());
+
+        self::assertSame(0, $this->fake->count(), 'not sent beside the other worker');
+        self::assertCount(1, MailServiceDelayedQueueSpy::$delayed);
+        self::assertSame(\Semitexa\Mail\Application\Service\MailService::ABANDONED_AFTER_SECONDS + 5, MailServiceDelayedQueueSpy::$delayed[0][2]);
+        $copy = QueuedMailMessage::fromJson(MailServiceDelayedQueueSpy::$delayed[0][1]);
+        self::assertTrue($copy->takeoverOnly);
+        self::assertSame(0, $copy->attempts, 'the same attempt, not one more');
+
+        // The holder ended it as deferred meanwhile: its own retry stands, the copy sends nothing.
+        unset($this->messages->heldByAnotherWorker[$id]);
+        $this->messages->save($this->messages->byId($id)->with(['status' => 'deferred']));
+        $this->worker()->processPayload($copy->toJson());
+        self::assertSame(0, $this->fake->count());
+        self::assertSame('deferred', $this->messages->byId($id)?->getStatus());
+
+        // Still `sending` (the holder died): taken over and sent.
+        $this->messages->save($this->messages->byId($id)->with(['status' => 'sending']));
+        $this->worker()->processPayload($copy->toJson());
+        self::assertSame(1, $this->fake->count());
+    }
+
     #[Test]
     public function a_redelivered_queue_message_does_not_send_twice(): void
     {
@@ -786,10 +827,24 @@ final class MailServiceRenderer implements MailTemplateRendererInterface
     }
 }
 
-final class MailServiceMessages implements MailRepositoryInterface, MailRecoveryInterface
+final class MailServiceMessages implements MailRepositoryInterface, MailRecoveryInterface, \Semitexa\Mail\Domain\Contract\MailSendingClaimInterface
 {
     /** @var array<string, MailMessage> */
     private array $byId = [];
+
+    /** @var array<string, true> rows another (live) worker is sending */
+    public array $heldByAnotherWorker = [];
+
+    public function claimForSending(MailMessage $message, \DateTimeImmutable $staleBefore): bool
+    {
+        $stored = $this->byId[$message->getId()] ?? null;
+        if ($stored === null || $stored->getStatus() === 'sent' || isset($this->heldByAnotherWorker[$message->getId()])) {
+            return false;
+        }
+        $this->byId[$message->getId()] = $stored->with(['status' => 'sending']);
+
+        return true;
+    }
 
     private int $next = 0;
 

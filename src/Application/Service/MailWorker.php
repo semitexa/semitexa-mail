@@ -15,6 +15,7 @@ use Semitexa\Mail\Domain\Model\MailMessage;
 use Semitexa\Mail\Domain\Contract\MailAttemptRepositoryInterface;
 use Semitexa\Mail\Domain\Contract\MailRetentionInterface;
 use Semitexa\Mail\Domain\Contract\MailRepositoryInterface;
+use Semitexa\Mail\Domain\Contract\MailSendingClaimInterface;
 use Semitexa\Mail\Domain\Contract\MailerConfigResolverInterface;
 use Semitexa\Mail\Domain\Model\QueuedMailMessage;
 use Semitexa\Mail\Application\Service\MailTransportRegistry;
@@ -212,13 +213,41 @@ final class MailWorker
             $this->log("Mail message '{$message->messageId}' already sent — skipping.", 'info');
             return;
         }
+        // The other worker ended it some other way: its own retry, or its
+        // failure, stands.
+        if ($message->takeoverOnly && $mailMessage->getStatus() !== MailMessageStatus::Sending->value) {
+            $this->log("Mail message '{$message->messageId}' was finished by the worker that held it ({$mailMessage->getStatus()}) — skipping.", 'info');
+            return;
+        }
 
         // Mark as sending, unless another worker on a redelivered copy has
-        // sent it since the read above: a plain save set it back to sending.
+        // sent it since the read above (a plain save set it back to sending),
+        // or is sending it now: a redelivery while the first worker was still
+        // on it delivered the mail twice. A `sending` row untouched for
+        // ABANDONED_AFTER_SECONDS is a worker that died, and is taken over.
         $mailMessage = $mailMessage->with([
             'status' => MailMessageStatus::Sending->value,
             'lastAttemptAt' => new \DateTimeImmutable(),
         ]);
+        if ($this->mailRepository instanceof MailSendingClaimInterface
+            && !$this->mailRepository->claimForSending($mailMessage, new \DateTimeImmutable('-' . MailService::ABANDONED_AFTER_SECONDS . ' seconds'))) {
+            if ($this->mailRepository->findById($message->messageId)?->getStatus() === MailMessageStatus::Sent->value) {
+                $this->log("Mail message '{$message->messageId}' already sent — skipping.", 'info');
+                return;
+            }
+            // Another worker is on it — or was, and died: a redelivery comes
+            // well inside the takeover window, and acknowledged here the mail
+            // was lost. Looked at again once that worker would be presumed
+            // dead: sent by then, it is skipped; still `sending`, it is taken.
+            $takeover = clone $message;
+            $takeover->takeoverOnly = true;
+            if ($this->republishLater($takeover, MailService::ABANDONED_AFTER_SECONDS + 5)) {
+                $this->log("Mail message '{$message->messageId}' is being sent by another worker — looking again later.", 'info');
+                return;
+            }
+            // A transport that cannot hold it back: delivered as before
+            // rather than lost, at the risk of a second delivery.
+        }
         if (!$this->mailRepository->saveOutcomeUnlessSent($mailMessage)) {
             $this->log("Mail message '{$message->messageId}' already sent — skipping.", 'info');
             return;
