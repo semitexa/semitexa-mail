@@ -4,7 +4,11 @@ declare(strict_types=1);
 
 namespace Semitexa\Mail\Application\Service;
 
+use Semitexa\Core\Attribute\InjectAsReadonly;
 use Semitexa\Core\Attribute\SatisfiesServiceContract;
+use Semitexa\Core\Locale\LocaleContextInterface;
+use Semitexa\Locale\Configuration\LocaleConfig;
+use Semitexa\Locale\Context\LocaleContextStore;
 use Semitexa\Mail\Domain\Contract\MailTemplateRendererInterface;
 use Semitexa\Ssr\Application\Service\Template\ModuleTemplateRegistry;
 use Twig\Environment as TwigEnvironment;
@@ -12,6 +16,9 @@ use Twig\Environment as TwigEnvironment;
 #[SatisfiesServiceContract(of: MailTemplateRendererInterface::class)]
 final class TwigMailTemplateRenderer implements MailTemplateRendererInterface
 {
+    #[InjectAsReadonly]
+    protected LocaleContextInterface $localeContext;
+
     /**
      * Templates live inside a module, under its template directory
      * (Application/View/templates in a src/modules module):
@@ -29,10 +36,71 @@ final class TwigMailTemplateRenderer implements MailTemplateRendererInterface
      *     packages — the order it resolves layouts in). The first module whose
      *     namespace has `mail/welcome.subject.txt.twig` provides all three parts.
      *
+     * A mail is rendered in its own locale: trans() and locale() in its
+     * templates answer for `$locale`, not for the request or job that sends
+     * it. The sender's locale is put back afterwards, whatever happens: the
+     * rest of that request still renders in it. Without a locale, the
+     * sender's is used.
+     *
      * @param array<string, mixed> $variables
      * @return array{subject: string, htmlBody: ?string, textBody: ?string}
      */
     public function render(string $templateHandle, array $variables, ?string $locale = null): array
+    {
+        if ($locale === null || trim($locale) === '') {
+            return $this->renderParts($templateHandle, $variables);
+        }
+
+        $sendersLocale = $this->localeContext->getLocale();
+        $this->localeContext->setLocale($this->supportedLocale($locale));
+        try {
+            return $this->renderParts($templateHandle, $variables);
+        } finally {
+            $this->localeContext->setLocale($sendersLocale);
+        }
+    }
+
+    /**
+     * The locale as the site has it. An envelope may carry uk-UA, uk_UA or
+     * UK; like the Accept-Language resolver, the full tag is taken when the
+     * site supports it, else its primary subtag when that is supported, else
+     * the tag as given (the catalog then falls back on its own). Compared
+     * without regard to case or separator, and answered as the site spells
+     * it: zh-Hant is not zh-HANT, and a site that wrote pt-br wants pt-br.
+     */
+    private function supportedLocale(string $locale): string
+    {
+        $parts = explode('-', self::comparable($locale), 2);
+        $primary = $parts[0];
+        $tag = isset($parts[1]) ? $primary . '-' . strtoupper($parts[1]) : $primary;
+
+        // Per tenant, resolved for this request; the configured set before that.
+        $supported = LocaleContextStore::getSupportedLocales();
+        if ($supported === []) {
+            $supported = LocaleConfig::fromEnvironment()->supportedLocales;
+        }
+
+        foreach ([implode('-', $parts), $primary] as $wanted) {
+            foreach ($supported as $spelled) {
+                if (self::comparable($spelled) === $wanted) {
+                    return $spelled;
+                }
+            }
+        }
+
+        return $tag;
+    }
+
+    private static function comparable(string $locale): string
+    {
+        return str_replace('_', '-', strtolower(trim($locale)));
+    }
+
+    /**
+     * @param array<string, mixed> $variables
+     * @return array{subject: string, htmlBody: ?string, textBody: ?string}
+     */
+    private function renderParts(string $templateHandle, array $variables): array
     {
         $twig = ModuleTemplateRegistry::getTwig();
         $base = $this->resolveBase($twig, $templateHandle);

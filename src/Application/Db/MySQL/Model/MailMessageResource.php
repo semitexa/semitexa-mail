@@ -28,6 +28,7 @@ use Semitexa\Orm\Metadata\HasRelationReferences;
 #[FromTable(name: 'mail_messages')]
 #[Index(columns: ['tenant_id', 'idempotency_key'], unique: true, name: 'uniq_mail_messages_tenant_idempotency')]
 #[Index(columns: ['status'], name: 'idx_mail_messages_status')]
+#[Index(columns: ['status', 'updated_at'], name: 'idx_mail_messages_status_updated')]
 #[Index(columns: ['tenant_id'], name: 'idx_mail_messages_tenant')]
 #[TenantScoped(strategy: 'same_storage', column: 'tenant_id')]
 final readonly class MailMessageResource
@@ -111,6 +112,12 @@ final readonly class MailMessageResource
 
         #[Column(type: MySqlType::Datetime)]
         public ?\DateTimeImmutable $updated_at = null,
+
+        #[Column(type: MySqlType::Varchar, length: 128, nullable: true)]
+        public ?string $mailer_key = null,
+
+        #[Column(type: MySqlType::Varchar, length: 255, nullable: true)]
+        public ?string $reply_to_name = null,
     ) {
     }
 

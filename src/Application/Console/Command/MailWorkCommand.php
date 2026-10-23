@@ -12,6 +12,7 @@ use Semitexa\Mail\Application\Service\MailWorker;
 use Semitexa\Mail\Domain\Contract\MailAttemptRepositoryInterface;
 use Semitexa\Mail\Domain\Contract\MailerConfigResolverInterface;
 use Semitexa\Mail\Domain\Contract\MailRepositoryInterface;
+use Semitexa\Mail\Domain\Contract\MailRetentionInterface;
 use Symfony\Component\Console\Command\Command;
 use Symfony\Component\Console\Input\InputArgument;
 use Symfony\Component\Console\Input\InputInterface;
@@ -40,7 +41,7 @@ final class MailWorkCommand extends Command
             ->addArgument(
                 name:        'transport',
                 mode:        InputArgument::OPTIONAL,
-                description: 'Queue transport: nats or in-memory (default from EVENTS_ASYNC)',
+                description: 'Queue transport: database, nats or in-memory (default from EVENTS_ASYNC / EVENTS_TRANSPORT)',
                 default:     null,
             )
             ->addArgument(
@@ -66,7 +67,11 @@ final class MailWorkCommand extends Command
             $configResolver = $container->get(MailerConfigResolverInterface::class);
             $attachResolver = $container->get(AttachmentResolver::class);
 
-            $worker = new MailWorker($mailRepository, $attemptRepo, $configResolver, $attachResolver);
+            $retention = $mailRepository instanceof MailRetentionInterface ? $mailRepository : null;
+            if ($retention === null && (int) \Semitexa\Core\Environment::getEnvValue('MAIL_RETENTION_DAYS', '0') > 0) {
+                $output->writeln('<comment>MAIL_RETENTION_DAYS is set, but the bound mail repository does not implement MailRetentionInterface: nothing is deleted.</comment>');
+            }
+            $worker = new MailWorker($mailRepository, $attemptRepo, $configResolver, $attachResolver, $retention);
             $worker->setOutput($output);
             $worker->run($transport, $queue);
         } catch (\Throwable $e) {

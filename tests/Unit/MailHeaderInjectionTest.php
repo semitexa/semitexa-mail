@@ -30,6 +30,65 @@ final class MailHeaderInjectionTest extends TestCase
     }
 
     #[Test]
+    public function an_attachment_name_type_or_content_id_cannot_add_a_header(): void
+    {
+        // They went into the part headers as given.
+        $message = $this->message();
+        $message->attachments = [new \Semitexa\Mail\Domain\Model\ResolvedAttachment(
+            filename: "a.pdf\"\r\nBcc: attacker@evil.example\r\nX: \"",
+            mimeType: "application/pdf\r\nBcc: attacker@evil.example",
+            contents: '%PDF',
+            disposition: 'inline',
+            contentId: "cid1>\r\nBcc: attacker@evil.example",
+        )];
+
+        $body = (new MimeBuilder())->build($message)['body'];
+
+        self::assertDoesNotMatchRegularExpression('/^Bcc:/mi', $body);
+        self::assertStringContainsString('Content-Type: application/octet-stream;', $body);
+    }
+
+    #[Test]
+    public function a_non_ascii_attachment_name_is_also_sent_encoded(): void
+    {
+        $message = $this->message();
+        $message->attachments = [new \Semitexa\Mail\Domain\Model\ResolvedAttachment(filename: 'звіт.pdf', mimeType: 'application/pdf', contents: '%PDF')];
+
+        $body = (new MimeBuilder())->build($message)['body'];
+
+        self::assertStringContainsString("filename*=UTF-8''" . rawurlencode('звіт.pdf'), $body);
+        self::assertStringContainsString('filename="____.pdf"', $body, 'one underscore per character');
+    }
+
+    #[Test]
+    public function a_valid_type_with_parameters_and_an_unusual_content_id_are_kept(): void
+    {
+        // The HTML's cid: reference must still match the part.
+        $message = $this->message();
+        $message->attachments = [new \Semitexa\Mail\Domain\Model\ResolvedAttachment(filename: 'logo "v2".png', mimeType: 'text/csv; charset=utf-8', contents: 'x', disposition: 'inline', contentId: 'logo#1/2x')];
+
+        $body = (new MimeBuilder())->build($message)['body'];
+
+        self::assertStringContainsString('Content-Type: text/csv; charset=utf-8;', $body);
+        self::assertStringContainsString('Content-ID: <logo#1/2x>', $body);
+        self::assertStringContainsString('filename="logo \\"v2\\".png"', $body, 'a quote is escaped, not dropped');
+    }
+
+    #[Test]
+    public function a_very_long_non_ascii_name_stays_inside_the_line_limit(): void
+    {
+        $message = $this->message();
+        $message->attachments = [new \Semitexa\Mail\Domain\Model\ResolvedAttachment(filename: str_repeat('звіт', 60) . '.pdf', mimeType: 'application/pdf', contents: 'x')];
+
+        $body = (new MimeBuilder())->build($message)['body'];
+
+        foreach (explode("\r\n", $body) as $line) {
+            self::assertLessThanOrEqual(998, strlen($line));
+        }
+        self::assertStringContainsString('.pdf"', $body, 'the extension is kept');
+    }
+
+    #[Test]
     public function a_line_break_in_a_custom_header_value_cannot_add_a_header(): void
     {
         $message = $this->message();
@@ -138,6 +197,44 @@ final class MailHeaderInjectionTest extends TestCase
     public function a_plain_name_is_still_quoted(): void
     {
         self::assertSame('"Bob \"B\" Smith" <bob@example.com>', (new MailRecipient('bob@example.com', 'Bob "B" Smith'))->formatted());
+    }
+
+    /** A 2 000-character subject and sixty named recipients were single lines past the 998 limit. */
+    #[Test]
+    public function long_ascii_headers_are_folded_within_the_line_limit(): void
+    {
+        $message = $this->message();
+        $message->subject = trim(str_repeat('word ', 400));
+        $message->to = array_map(static fn (int $i): MailRecipient => new MailRecipient("user{$i}@example.com", "Recipient Number {$i}"), range(1, 60));
+
+        $headers = (new MimeBuilder())->build($message)['headers'];
+
+        foreach (explode("\r\n", $headers) as $line) {
+            self::assertLessThanOrEqual(998, strlen($line));
+        }
+        $unfolded = (string) preg_replace("/\r\n[ \t]/", ' ', $headers);
+        self::assertStringContainsString('Subject: ' . $message->subject . "\r\n", $unfolded . "\r\n");
+        self::assertStringContainsString('<user60@example.com>', $headers);
+    }
+
+    #[Test]
+    public function a_local_relay_is_this_machine_or_a_one_word_host(): void
+    {
+        foreach (['localhost', '127.0.0.1', '::1', 'mailpit', 'smtp'] as $host) {
+            self::assertTrue(\Semitexa\Mail\Application\Service\SmtpMailTransport::isLocalRelay($host), $host);
+        }
+        foreach (['smtp.example.com', '203.0.113.5', 'mail.internal'] as $host) {
+            self::assertFalse(\Semitexa\Mail\Application\Service\SmtpMailTransport::isLocalRelay($host), $host);
+        }
+    }
+
+    /** `?: null` turned the contents "0" into no attachment at all. */
+    #[Test]
+    public function an_attachment_whose_contents_are_zero_is_kept(): void
+    {
+        $ref = \Semitexa\Mail\Domain\Model\AttachmentReference::fromStored(['filename' => 'zero.txt', 'inlineContentsBase64' => base64_encode('0')]);
+
+        self::assertSame('0', $ref->inlineContents);
     }
 
     private function message(): PreparedMailMessage
