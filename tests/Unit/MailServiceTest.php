@@ -241,6 +241,41 @@ final class MailServiceTest extends TestCase
         self::assertSame(0, $this->fake->count());
     }
 
+    /** Past the column's 998 characters a strict MySQL refused the insert, and send() threw. */
+    #[Test]
+    public function a_subject_past_998_characters_fails_the_mail_instead_of_throwing(): void
+    {
+        $envelope = $this->envelope();
+        $envelope->subject = str_repeat('é', 999);
+
+        $result = $this->service()->send($envelope, $this->now());
+
+        self::assertSame(MailDispatchStatus::Failed, $result->status);
+        self::assertSame('invalid_message', $result->errorCode);
+        self::assertNull($this->fake->getLastMessage(), 'nothing sent');
+
+        $envelope = $this->envelope();
+        $envelope->subject = str_repeat('é', 998);
+        self::assertNotSame(MailDispatchStatus::Failed, $this->service()->send($envelope, $this->now())->status, 'exactly 998 characters fit');
+    }
+
+    /** The same for every column with a length, and for a value that is not UTF-8. */
+    #[Test]
+    public function a_field_mail_messages_cannot_hold_fails_the_mail(): void
+    {
+        $long = $this->envelope();
+        $long->idempotencyKey = str_repeat('k', 256);
+        $broken = $this->envelope();
+        $broken->subject = "Caf\xE9";
+
+        foreach (['idempotencyKey' => $long, 'subject' => $broken] as $field => $envelope) {
+            $result = $this->service()->send($envelope, $this->now());
+            self::assertSame('invalid_message', $result->errorCode, $field);
+            self::assertStringContainsString($field, (string) $result->errorMessage);
+        }
+        self::assertNull($this->fake->getLastMessage());
+    }
+
     /** A queue worker has no tenant: feature() in a site's mail answered with every site's setting. */
     #[Test]
     public function a_template_s_flags_answer_for_the_mail_s_site(): void

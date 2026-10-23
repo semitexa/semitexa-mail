@@ -16,6 +16,8 @@ enum MailErrorCode: string
     case InvalidRecipient = 'invalid_recipient';
     case AttachmentMissing = 'attachment_missing';
     case RenderFailed = 'render_failed';
+    /** The mail itself cannot be stored or sent as it is (a subject past 998 characters). */
+    case InvalidMessage = 'invalid_message';
     case QueueUnavailable = 'queue_unavailable';
     case UnknownTransportError = 'unknown_transport_error';
 

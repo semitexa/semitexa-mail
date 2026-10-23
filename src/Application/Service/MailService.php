@@ -143,6 +143,27 @@ final class MailService implements MailServiceInterface
         $fromName  = $envelope->from?->name  ?? $config->fromName;
         $replyTo   = $envelope->replyTo?->email ?? $config->replyTo;
 
+        // Past a column's length, or not UTF-8, a strict MySQL refused the
+        // insert and send() threw, where every other bad mail answers Failed.
+        $unstorable = self::unstorable([
+            'subject' => [$subject, 998],
+            'tenantId' => [$envelope->tenantId, 64],
+            'templateHandle' => [$envelope->templateHandle, 255],
+            'from' => [$fromEmail, 255],
+            'fromName' => [$fromName, 255],
+            'replyTo' => [$replyTo, 255],
+            'replyToName' => [$envelope->replyTo?->name, 255],
+            'idempotencyKey' => [$envelope->idempotencyKey, 255],
+            'mailerKey' => [$envelope->mailerKey, 128],
+        ]);
+        if ($unstorable !== null) {
+            return new MailDispatchResult(
+                status:       MailDispatchStatus::Failed,
+                errorCode:    MailErrorCode::InvalidMessage->value,
+                errorMessage: $unstorable,
+            );
+        }
+
         // Persist mail message (rendered bodies stored before queue dispatch).
         // Resources are readonly: save() returns the persisted row (with the
         // engine-generated UUID) — always continue with the RETURNED instance.
@@ -183,6 +204,29 @@ final class MailService implements MailServiceInterface
         }
 
         return $this->deliverOrQueue($mailMessage, $options, $config);
+    }
+
+    /**
+     * The first field mail_messages cannot hold: longer than its column (in
+     * characters, as utf8mb4 counts them) or not UTF-8.
+     *
+     * @param array<string, array{?string, int}> $fields name => [value, column length]
+     */
+    private static function unstorable(array $fields): ?string
+    {
+        foreach ($fields as $name => [$value, $max]) {
+            if ($value === null) {
+                continue;
+            }
+            if (!mb_check_encoding($value, 'UTF-8')) {
+                return sprintf('The %s is not valid UTF-8.', $name);
+            }
+            if (mb_strlen($value, 'UTF-8') > $max) {
+                return sprintf('The %s is %d characters long; at most %d are stored.', $name, mb_strlen($value, 'UTF-8'), $max);
+            }
+        }
+
+        return null;
     }
 
     /**
