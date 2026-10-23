@@ -241,6 +241,22 @@ final class MailServiceTest extends TestCase
         self::assertSame(0, $this->fake->count());
     }
 
+    /** A queue worker has no tenant: feature() in a site's mail answered with every site's setting. */
+    #[Test]
+    public function a_template_s_flags_answer_for_the_mail_s_site(): void
+    {
+        $envelope = $this->envelope();
+        $envelope->templateHandle = 'welcome';
+        $envelope->variables = ['name' => 'Ada'];
+        $envelope->tenantId = 'acme';
+        MailServiceRenderer::$flagSubject = null;
+
+        $this->service()->send($envelope, $this->now());
+
+        self::assertSame(['acme', null], MailServiceRenderer::$flagSubject);
+        self::assertNull(\Semitexa\Core\Feature\CurrentFeatureFlags::subject(), 'put back after the render');
+    }
+
     #[Test]
     public function a_template_renders_the_subject_and_bodies(): void
     {
@@ -821,8 +837,13 @@ final class MailServiceConfig implements MailerConfigResolverInterface
 
 final class MailServiceRenderer implements MailTemplateRendererInterface
 {
+    /** @var array{0: ?string, 1: ?string}|null whom feature() answered for in the last render */
+    public static ?array $flagSubject = null;
+
     public function render(string $templateHandle, array $variables, ?string $locale = null): array
     {
+        self::$flagSubject = \Semitexa\Core\Feature\CurrentFeatureFlags::subject();
+
         return ['subject' => 'Welcome, ' . $variables['name'], 'htmlBody' => '<p>Hi ' . $variables['name'] . '</p>', 'textBody' => 'Hi ' . $variables['name']];
     }
 }

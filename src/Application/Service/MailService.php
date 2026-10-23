@@ -6,6 +6,7 @@ namespace Semitexa\Mail\Application\Service;
 
 use Semitexa\Core\Attribute\InjectAsReadonly;
 use Semitexa\Core\Attribute\SatisfiesServiceContract;
+use Semitexa\Core\Feature\CurrentFeatureFlags;
 use Semitexa\Core\Log\StaticLoggerBridge;
 use Semitexa\Core\Queue\DelayedQueueTransportInterface;
 use Semitexa\Core\Queue\QueueConfig;
@@ -116,11 +117,15 @@ final class MailService implements MailServiceInterface
 
         if ($envelope->templateHandle !== null) {
             try {
-                $rendered = $this->renderer->render(
+                // feature() in the template answers for the mail's site, and
+                // for no user: a queue worker has no tenant, and answered with
+                // every site's; inside a request it answered for the sender.
+                $render = fn (): array => $this->renderer->render(
                     $envelope->templateHandle,
                     $envelope->variables,
                     $envelope->locale,
                 );
+                $rendered = CurrentFeatureFlags::forSubjectDuring($envelope->tenantId, null, $render);
                 $subject  = $rendered['subject'];
                 $htmlBody = $rendered['htmlBody'];
                 $textBody = $rendered['textBody'];
