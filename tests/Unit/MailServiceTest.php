@@ -61,7 +61,9 @@ final class MailServiceTest extends TestCase
 
     protected function setUp(): void
     {
-        foreach ([MailTransportRegistry::class, QueueTransportRegistry::class, \Semitexa\Core\Log\StaticLoggerBridge::class] as $class) {
+        // The test doubles' own statics too: what one test left in a spy is
+        // put back for whatever ran before this class, not wiped.
+        foreach ([MailTransportRegistry::class, QueueTransportRegistry::class, \Semitexa\Core\Log\StaticLoggerBridge::class, MailServiceQueueSpy::class, MailServiceDelayedQueueSpy::class, MailServiceConfig::class, MailServiceRenderer::class] as $class) {
             $this->registries[$class] = self::statics($class);
         }
         MailTransportRegistry::reset();
@@ -72,6 +74,7 @@ final class MailServiceTest extends TestCase
         QueueTransportRegistry::reset();
         MailServiceQueueSpy::$published = [];
         MailServiceQueueSpy::$refuse = false;
+        MailServiceDelayedQueueSpy::$delayed = [];
         MailServiceConfig::$mailerKeys = [];
         $this->eventsAsync = getenv('EVENTS_ASYNC');
         $this->eventsTransport = getenv('EVENTS_TRANSPORT');
