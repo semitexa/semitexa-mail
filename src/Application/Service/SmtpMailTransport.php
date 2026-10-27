@@ -90,15 +90,43 @@ final class SmtpMailTransport implements MailTransportInterface
             $this->sendCommand($socket, "MAIL FROM:<{$message->from->email}>", 250);
 
             $allRecipients = [...$message->to, ...$message->cc, ...$message->bcc];
+            // One address the server refuses for good (a mistyped cc) failed
+            // the mail for everyone: it goes to the others, and the refused
+            // ones are reported. A temporary refusal still defers the whole
+            // mail: sent now, its retry would reach the others twice.
+            $refused = [];
+            $lastRefusal = null;
             foreach ($allRecipients as $recipient) {
                 try {
                     $this->sendCommand($socket, "RCPT TO:<{$recipient->email}>", 250);
                 } catch (SmtpException $e) {
                     // 251, "will forward", is an accepted recipient too.
-                    if ($e->smtpCode !== 251) {
+                    if ($e->smtpCode === 251) {
+                        continue;
+                    }
+                    // "Too many recipients" (5.5.3; RFC 5321 §4.5.3.1.10 asks 452,
+                    // servers also answer 550/552/554): skipped, the rest of a long
+                    // list was dropped and the mail counted as sent; deferred, every
+                    // retry hits the same limit. It fails the mail at once, as
+                    // invalid_recipient. Another 552 (a full mailbox, 5.2.2)
+                    // refuses that one recipient.
+                    if ($e->smtpCode >= 400 && $e->smtpCode < 600 && preg_match('/^\d{3}[ -][45]\.5\.3\b|too many recipients/im', $e->smtpResponse) === 1) {
+                        throw new SmtpException($e->getMessage() . ' (too many recipients for this server: split the list)', 552, $e->smtpResponse, $e);
+                    }
+                    // Only a 5xx is a refusal for good; anything else (a 4xx,
+                    // no reply, a reply out of step) stops the whole mail.
+                    if ($e->smtpCode < 500 || $e->smtpCode >= 600) {
                         throw $e;
                     }
+                    // One line: a multi-line reply split the row's message and the log line.
+                    // ASCII only: a legacy server's 8-bit reply made strict MySQL refuse
+                    // the save of the sent row, left sending, and sent again.
+                    $refused[] = ['email' => $recipient->email, 'smtp_code' => $e->smtpCode, 'smtp_response' => trim((string) preg_replace(['/\s*\r?\n\s*/', '/[^\x20-\x7E]/'], [' ', '?'], $e->smtpResponse))];
+                    $lastRefusal = $e;
                 }
+            }
+            if ($lastRefusal !== null && count($refused) === count($allRecipients)) {
+                throw $lastRefusal;
             }
 
             $this->sendCommand($socket, 'DATA', 354);
@@ -144,8 +172,15 @@ final class SmtpMailTransport implements MailTransportInterface
             return new MailTransportResult(
                 status: MailTransportStatus::Accepted,
                 providerMessageId: $message->messageId,
-                providerStatus: 'sent',
-                providerResponse: ['smtp_response' => $dataResponse],
+                // Said on the message row, which still reads sent: a refused
+                // cc showed nowhere anyone looks.
+                errorMessage: $refused === [] ? null : 'Not delivered to: ' . implode('; ', array_map(
+                    // The reply starts with its code.
+                    static fn (array $r): string => "{$r['email']} ({$r['smtp_response']})",
+                    $refused,
+                )),
+                providerStatus: $refused === [] ? 'sent' : 'sent_partially',
+                providerResponse: ['smtp_response' => $dataResponse] + ($refused === [] ? [] : ['refused_recipients' => $refused]),
             );
         } catch (SmtpException $e) {
             $errorCode = $this->classifySmtpError($e);

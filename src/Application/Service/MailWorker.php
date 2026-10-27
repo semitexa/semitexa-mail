@@ -341,11 +341,15 @@ final class MailWorker
                 'status' => MailMessageStatus::Sent->value,
                 'providerMessageId' => $result->providerMessageId,
                 'errorCode' => null,
-                'errorMessage' => null,
+                // Sent to some recipients only: who did not get it.
+                'errorMessage' => $result->errorMessage,
             ]));
             $attemptNo = $recordAttempt();
             $this->outcome = 'processed';
             $this->log("Mail '{$message->messageId}' sent (attempt {$attemptNo}).", 'success');
+            if ($result->errorMessage !== null) {
+                $this->log("Mail '{$message->messageId}': {$result->errorMessage}", 'warning');
+            }
             return;
         }
 

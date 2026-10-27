@@ -163,4 +163,91 @@ final class MailSmallFixesTest extends TestCase
 
         return [$process, (int) substr($address, strrpos($address, ':') + 1)];
     }
+
+    /** One address refused for good (a mistyped cc) failed the mail for everyone. */
+    #[Test]
+    public function a_recipient_refused_for_good_is_skipped_and_reported_and_the_others_get_the_mail(): void
+    {
+        $message = $this->message();
+        $message->cc = [new MailRecipient('typo@nowhere.test'), new MailRecipient('full@example.test')];
+        // A full mailbox (552 5.2.2) refuses that one recipient, not the mail.
+        [$process, $port] = self::smtpServer(['typo@nowhere.test' => '550 5.1.1 no such user', 'full@example.test' => '552 5.2.2 mailbox full']);
+        try {
+            $result = (new \Semitexa\Mail\Application\Service\SmtpMailTransport())->deliver($message, new \Semitexa\Mail\Domain\Model\MailerConfig(host: '127.0.0.1', port: $port, timeoutSeconds: 5));
+        } finally {
+            proc_terminate($process);
+            proc_close($process);
+        }
+
+        self::assertSame('accepted', $result->status->value, (string) $result->errorMessage);
+        self::assertSame('sent_partially', $result->providerStatus);
+        self::assertSame('typo@nowhere.test', $result->providerResponse['refused_recipients'][0]['email'] ?? null);
+        self::assertSame(550, $result->providerResponse['refused_recipients'][0]['smtp_code'] ?? null);
+        self::assertStringContainsString('typo@nowhere.test (550', (string) $result->errorMessage, 'said on the row, which reads sent');
+        self::assertSame(552, $result->providerResponse['refused_recipients'][1]['smtp_code'] ?? null);
+    }
+
+    #[Test]
+    public function every_recipient_refused_fails_the_mail_and_a_temporary_refusal_defers_all(): void
+    {
+        // "Too many recipients", whatever its code: the mail fails at once, not the rest dropped, not retried.
+        foreach ([['550 5.1.1 no such user', 'failed'], ['451 4.3.0 try later', 'deferred'], ['552 5.5.3 too many recipients', 'failed'], ['452 4.5.3 too many recipients', 'failed'], ['554 5.5.3 recipient limit', 'failed']] as [$reply, $status]) {
+            $message = $this->message();
+            $message->cc = [new MailRecipient('second@example.test')];
+            [$process, $port] = self::smtpServer(['ada@example.test' => $reply, 'second@example.test' => $reply]);
+            try {
+                $result = (new \Semitexa\Mail\Application\Service\SmtpMailTransport())->deliver($message, new \Semitexa\Mail\Domain\Model\MailerConfig(host: '127.0.0.1', port: $port, timeoutSeconds: 5));
+            } finally {
+                proc_terminate($process);
+                proc_close($process);
+            }
+            self::assertSame($status, $result->status->value, $reply);
+            if (str_contains($reply, '.5.3')) {
+                self::assertSame('invalid_recipient', $result->errorCode, $reply);
+            }
+        }
+    }
+
+    /** A legacy server's 8-bit reply reaches the sent row ASCII-only, on one line. */
+    #[Test]
+    public function a_refusal_reply_is_stored_as_one_ascii_line_without_its_code_twice(): void
+    {
+        $message = $this->message();
+        $message->cc = [new MailRecipient('typo@nowhere.test')];
+        [$process, $port] = self::smtpServer(['typo@nowhere.test' => "550-5.1.1 Empf\xE4nger\r\n550 5.1.1 unbekannt"]);
+        try {
+            $result = (new \Semitexa\Mail\Application\Service\SmtpMailTransport())->deliver($message, new \Semitexa\Mail\Domain\Model\MailerConfig(host: '127.0.0.1', port: $port, timeoutSeconds: 5));
+        } finally {
+            proc_terminate($process);
+            proc_close($process);
+        }
+
+        self::assertSame('accepted', $result->status->value, (string) $result->errorMessage);
+        self::assertSame('Not delivered to: typo@nowhere.test (550-5.1.1 Empf?nger 550 5.1.1 unbekannt)', $result->errorMessage);
+    }
+
+    /**
+     * A one-connection SMTP server for a plain session; RCPT for an address
+     * in $refusals answers that reply.
+     *
+     * @param array<string, string> $refusals
+     * @return array{resource, int}
+     */
+    private static function smtpServer(array $refusals): array
+    {
+        $script = '$r = ' . var_export($refusals, true) . '; $s = stream_socket_server("tcp://127.0.0.1:0"); fwrite(STDOUT, stream_socket_get_name($s, false) . "\n"); fflush(STDOUT);'
+            . '$c = stream_socket_accept($s, 10); fwrite($c, "220 test ESMTP\r\n"); $data = false;'
+            . 'while (($l = fgets($c)) !== false) { if ($data) { if (rtrim($l, "\r\n") === ".") { $data = false; fwrite($c, "250 queued\r\n"); } continue; }'
+            . '$u = strtoupper(trim($l));'
+            . 'if (str_starts_with($u, "EHLO")) { fwrite($c, "250 test\r\n"); }'
+            . 'elseif (str_starts_with($u, "MAIL FROM")) { fwrite($c, "250 ok\r\n"); }'
+            . 'elseif (str_starts_with($u, "RCPT TO")) { preg_match("/<([^>]*)>/", $l, $m); fwrite($c, ($r[$m[1]] ?? "250 ok") . "\r\n"); }'
+            . 'elseif ($u === "DATA") { $data = true; fwrite($c, "354 go\r\n"); }'
+            . 'elseif ($u === "QUIT") { fwrite($c, "221 bye\r\n"); break; } else { fwrite($c, "500 what\r\n"); } }';
+        $process = proc_open([PHP_BINARY, '-r', $script], [1 => ['pipe', 'w'], 2 => ['pipe', 'w']], $pipes);
+        self::assertIsResource($process);
+        $address = trim((string) fgets($pipes[1]));
+
+        return [$process, (int) substr($address, strrpos($address, ':') + 1)];
+    }
 }

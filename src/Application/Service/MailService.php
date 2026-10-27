@@ -509,6 +509,10 @@ final class MailService implements MailServiceInterface
         }
 
         if ($result->status === MailTransportStatus::Accepted) {
+            if ($result->errorMessage !== null) {
+                StaticLoggerBridge::warning('mail', "Mail '{$messageId}': {$result->errorMessage}");
+            }
+
             return new MailDispatchResult(
                 status:    MailDispatchStatus::Sent,
                 messageId: $messageId,
