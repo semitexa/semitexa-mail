@@ -40,17 +40,25 @@ class MailMessageRepository implements MailRepositoryInterface, MailRetentionInt
 
     public function findByIdempotencyKey(?string $tenantId, string $idempotencyKey): ?MailMessage
     {
-        // System mail (no tenant) is looked up among the rows with no tenant:
-        // it was never looked up, and the unique index cannot catch a repeat
-        // either, since it lets any number of NULL tenants through.
-        $query = $tenantId === null
-            ? $this->system()->query()->whereNull(MailMessageResource::column('tenant_id'))
-            : $this->repository()->forTenant($tenantId)->query();
+        if ($tenantId !== null) {
+            /** @var MailMessage|null */
+            return $this->repository()->forTenant($tenantId)->query()
+                ->where(MailMessageResource::column('idempotency_key'), Operator::Equals, $idempotencyKey)
+                ->fetchOneAs(MailMessage::class, $this->orm()->getMapperRegistry());
+        }
 
+        // System mail (no tenant) is stored with tenant '' (the mapper), which
+        // the unique index holds to one row per key; a row from before that
+        // has NULL, and is found too.
         /** @var MailMessage|null */
-        return $query
+        return $this->system()->query()
+            ->where(MailMessageResource::column('tenant_id'), Operator::Equals, '')
             ->where(MailMessageResource::column('idempotency_key'), Operator::Equals, $idempotencyKey)
-            ->fetchOneAs(MailMessage::class, $this->orm()->getMapperRegistry());
+            ->fetchOneAs(MailMessage::class, $this->orm()->getMapperRegistry())
+            ?? $this->system()->query()
+                ->whereNull(MailMessageResource::column('tenant_id'))
+                ->where(MailMessageResource::column('idempotency_key'), Operator::Equals, $idempotencyKey)
+                ->fetchOneAs(MailMessage::class, $this->orm()->getMapperRegistry());
     }
 
     public function save(MailMessage $entity): MailMessage
