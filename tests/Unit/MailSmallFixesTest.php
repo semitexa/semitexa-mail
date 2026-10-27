@@ -226,6 +226,59 @@ final class MailSmallFixesTest extends TestCase
         self::assertSame('Not delivered to: typo@nowhere.test (550-5.1.1 Empf?nger 550 5.1.1 unbekannt)', $result->errorMessage);
     }
 
+    /** An address that is not ASCII went out as raw 8-bit bytes to any server. */
+    #[Test]
+    public function a_non_ascii_address_needs_smtputf8_and_is_sent_with_it(): void
+    {
+        foreach ([false => 'failed', true => 'accepted'] as $smtpUtf8 => $status) {
+            $message = $this->message();
+            $message->to = [new MailRecipient('андрій@example.test')];
+            [$process, $port] = self::smtpServer([], (bool) $smtpUtf8);
+            try {
+                $result = (new \Semitexa\Mail\Application\Service\SmtpMailTransport())->deliver($message, new \Semitexa\Mail\Domain\Model\MailerConfig(host: '127.0.0.1', port: $port, timeoutSeconds: 5));
+            } finally {
+                proc_terminate($process);
+                proc_close($process);
+            }
+            self::assertSame($status, $result->status->value, (string) $result->errorMessage);
+            if (!$smtpUtf8) {
+                // Not invalid_recipient: again() never resends that, and the fix is a setup one.
+                self::assertSame('config_error', $result->errorCode);
+                self::assertStringContainsString('андрій@example.test needs SMTPUTF8', (string) $result->errorMessage);
+                self::assertStringNotContainsString('intl', (string) $result->errorMessage, 'intl cannot help a local part');
+            }
+        }
+    }
+
+    #[Test]
+    public function a_non_ascii_domain_goes_as_punycode_with_ext_intl(): void
+    {
+        $message = $this->message();
+        $message->to = [new MailRecipient('ada@приклад.укр'), new MailRecipient('bob@приклад.укр')];
+        [$process, $port] = self::smtpServer(['ada@xn--80aikifvh.xn--j1amh' => '250 ok punycode', 'bob@xn--80aikifvh.xn--j1amh' => '550 5.1.1 no such user']);
+        try {
+            $result = (new \Semitexa\Mail\Application\Service\SmtpMailTransport())->deliver($message, new \Semitexa\Mail\Domain\Model\MailerConfig(host: '127.0.0.1', port: $port, timeoutSeconds: 5));
+        } finally {
+            proc_terminate($process);
+            proc_close($process);
+        }
+        if (function_exists('idn_to_ascii')) {
+            self::assertSame('accepted', $result->status->value, (string) $result->errorMessage);
+            self::assertSame('sent_partially', $result->providerStatus);
+            self::assertSame('Not delivered to: bob@приклад.укр (550 5.1.1 no such user)', $result->errorMessage, 'the stored address, not its punycode');
+        } else {
+            self::assertSame('failed', $result->status->value);
+            self::assertStringContainsString('PHP intl extension', (string) $result->errorMessage);
+        }
+    }
+
+    #[Test]
+    public function an_address_that_is_not_utf8_is_refused(): void
+    {
+        $this->expectException(\InvalidArgumentException::class);
+        new MailRecipient("ada\xE4@example.test");
+    }
+
     /**
      * A one-connection SMTP server for a plain session; RCPT for an address
      * in $refusals answers that reply.
@@ -233,14 +286,14 @@ final class MailSmallFixesTest extends TestCase
      * @param array<string, string> $refusals
      * @return array{resource, int}
      */
-    private static function smtpServer(array $refusals): array
+    private static function smtpServer(array $refusals, bool $smtpUtf8 = false): array
     {
-        $script = '$r = ' . var_export($refusals, true) . '; $s = stream_socket_server("tcp://127.0.0.1:0"); fwrite(STDOUT, stream_socket_get_name($s, false) . "\n"); fflush(STDOUT);'
+        $script = '$r = ' . var_export($refusals, true) . '; $u8 = ' . var_export($smtpUtf8, true) . '; $s = stream_socket_server("tcp://127.0.0.1:0"); fwrite(STDOUT, stream_socket_get_name($s, false) . "\n"); fflush(STDOUT);'
             . '$c = stream_socket_accept($s, 10); fwrite($c, "220 test ESMTP\r\n"); $data = false;'
             . 'while (($l = fgets($c)) !== false) { if ($data) { if (rtrim($l, "\r\n") === ".") { $data = false; fwrite($c, "250 queued\r\n"); } continue; }'
             . '$u = strtoupper(trim($l));'
-            . 'if (str_starts_with($u, "EHLO")) { fwrite($c, "250 test\r\n"); }'
-            . 'elseif (str_starts_with($u, "MAIL FROM")) { fwrite($c, "250 ok\r\n"); }'
+            . 'if (str_starts_with($u, "EHLO")) { fwrite($c, $u8 ? "250-test\r\n250 SMTPUTF8\r\n" : "250 test\r\n"); }'
+            . 'elseif (str_starts_with($u, "MAIL FROM")) { fwrite($c, $u8 && !str_ends_with($u, " SMTPUTF8") ? "555 no SMTPUTF8 parameter\r\n" : "250 ok\r\n"); }'
             . 'elseif (str_starts_with($u, "RCPT TO")) { preg_match("/<([^>]*)>/", $l, $m); fwrite($c, ($r[$m[1]] ?? "250 ok") . "\r\n"); }'
             . 'elseif ($u === "DATA") { $data = true; fwrite($c, "354 go\r\n"); }'
             . 'elseif ($u === "QUIT") { fwrite($c, "221 bye\r\n"); break; } else { fwrite($c, "500 what\r\n"); } }';

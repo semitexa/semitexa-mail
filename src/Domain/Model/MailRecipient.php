@@ -16,6 +16,10 @@ final readonly class MailRecipient
         if (preg_match('/[\x00-\x1F\x7F<>]/', $email) === 1) {
             throw new \InvalidArgumentException('Mail address contains a control character or angle bracket.');
         }
+        // Bytes that are not UTF-8 went to the server as they were.
+        if (preg_match('//u', $email) !== 1) {
+            throw new \InvalidArgumentException('Mail address is not valid UTF-8.');
+        }
     }
 
     public function formatted(): string

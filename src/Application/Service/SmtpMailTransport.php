@@ -15,6 +15,7 @@ use Semitexa\Mail\Domain\Enum\MailErrorCode;
 use Semitexa\Mail\Domain\Model\MailTransportResult;
 use Semitexa\Mail\Domain\Enum\MailTransportStatus;
 use Semitexa\Mail\Domain\Model\PreparedMailMessage;
+use Semitexa\Mail\Domain\Model\MailRecipient;
 
 final class SmtpMailTransport implements MailTransportInterface
 {
@@ -48,6 +49,11 @@ final class SmtpMailTransport implements MailTransportInterface
             if ($encryption !== null && !in_array($encryption, ['tls', 'ssl'], true)) {
                 throw new MailTlsException("MAIL_ENCRYPTION '{$config->encryption}' is not tls or ssl: nothing is sent in plain text instead.");
             }
+            // A non-ASCII domain went out raw, in RCPT TO and the headers: it
+            // goes as its ASCII (punycode) form when ext-intl is there.
+            // The refusals name the address as stored, not its punycode.
+            $original = $message;
+            $message = self::withAsciiDomains($message);
             $mime = $this->mimeBuilder->build($message);
 
             $socket = $this->connect($config, $encryption);
@@ -76,6 +82,23 @@ final class SmtpMailTransport implements MailTransportInterface
                 $ehlo = $this->sendEhlo($socket);
             }
 
+            // What is still not ASCII (a local part, or a domain without
+            // ext-intl) needs SMTPUTF8 (RFC 6531); a server without it got
+            // raw 8-bit bytes in MAIL FROM, RCPT TO and the headers.
+            $international = self::nonAsciiAddresses($message);
+            $smtpUtf8 = $international !== [] && preg_match('/^250[ -]SMTPUTF8\b/mi', $ehlo) === 1;
+            // config_error, not invalid_recipient: again() refuses to resend
+            // that, and the fix (ext-intl, another MAIL_HOST) is a setup one.
+            if ($international !== [] && !$smtpUtf8) {
+                $domainOnly = array_filter($international, static fn (string $a): bool => preg_match('/[^\x00-\x7F]/', substr($a, 0, (int) strrpos($a, '@'))) !== 1);
+                return new MailTransportResult(
+                    status: MailTransportStatus::Failed,
+                    errorCode: MailErrorCode::ConfigError->value,
+                    errorMessage: 'Not sent: ' . implode(', ', $international) . " needs SMTPUTF8, which {$config->host} does not offer"
+                        . ($domainOnly !== [] && !function_exists('idn_to_ascii') ? ' (with the PHP intl extension a non-ASCII domain is sent as punycode).' : '.'),
+                );
+            }
+
             if ($config->username !== null && $config->password !== null) {
                 // The password went to any host in plain text when
                 // MAIL_ENCRYPTION was empty, its default. A local relay (this
@@ -87,16 +110,17 @@ final class SmtpMailTransport implements MailTransportInterface
                 $this->authenticate($socket, $config->username, $config->password, $ehlo);
             }
 
-            $this->sendCommand($socket, "MAIL FROM:<{$message->from->email}>", 250);
+            $this->sendCommand($socket, "MAIL FROM:<{$message->from->email}>" . ($smtpUtf8 ? ' SMTPUTF8' : ''), 250);
 
             $allRecipients = [...$message->to, ...$message->cc, ...$message->bcc];
+            $storedRecipients = [...$original->to, ...$original->cc, ...$original->bcc];
             // One address the server refuses for good (a mistyped cc) failed
             // the mail for everyone: it goes to the others, and the refused
             // ones are reported. A temporary refusal still defers the whole
             // mail: sent now, its retry would reach the others twice.
             $refused = [];
             $lastRefusal = null;
-            foreach ($allRecipients as $recipient) {
+            foreach ($allRecipients as $i => $recipient) {
                 try {
                     $this->sendCommand($socket, "RCPT TO:<{$recipient->email}>", 250);
                 } catch (SmtpException $e) {
@@ -121,7 +145,7 @@ final class SmtpMailTransport implements MailTransportInterface
                     // One line: a multi-line reply split the row's message and the log line.
                     // ASCII only: a legacy server's 8-bit reply made strict MySQL refuse
                     // the save of the sent row, left sending, and sent again.
-                    $refused[] = ['email' => $recipient->email, 'smtp_code' => $e->smtpCode, 'smtp_response' => trim((string) preg_replace(['/\s*\r?\n\s*/', '/[^\x20-\x7E]/'], [' ', '?'], $e->smtpResponse))];
+                    $refused[] = ['email' => $storedRecipients[$i]->email, 'smtp_code' => $e->smtpCode, 'smtp_response' => trim((string) preg_replace(['/\s*\r?\n\s*/', '/[^\x20-\x7E]/'], [' ', '?'], $e->smtpResponse))];
                     $lastRefusal = $e;
                 }
             }
@@ -366,6 +390,42 @@ final class SmtpMailTransport implements MailTransportInterface
         }
 
         return is_string($ip) && filter_var($ip, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4) !== false ? "[{$ip}]" : '[127.0.0.1]';
+    }
+
+    /** The message with every non-ASCII domain in its ASCII form, when ext-intl can make one. */
+    private static function withAsciiDomains(PreparedMailMessage $message): PreparedMailMessage
+    {
+        if (!function_exists('idn_to_ascii') || self::nonAsciiAddresses($message) === []) {
+            return $message;
+        }
+        $ascii = static function (MailRecipient $r): MailRecipient {
+            $at = strrpos($r->email, '@');
+            if ($at === false || preg_match('/[^\x00-\x7F]/', substr($r->email, $at + 1)) !== 1) {
+                return $r;
+            }
+            $domain = idn_to_ascii(substr($r->email, $at + 1), IDNA_NONTRANSITIONAL_TO_ASCII, INTL_IDNA_VARIANT_UTS46);
+
+            return $domain === false ? $r : new MailRecipient(substr($r->email, 0, $at + 1) . $domain, $r->name);
+        };
+        $copy = clone $message;
+        $copy->from = $ascii($message->from);
+        $copy->replyTo = $message->replyTo === null ? null : $ascii($message->replyTo);
+        $copy->to = array_map($ascii, $message->to);
+        $copy->cc = array_map($ascii, $message->cc);
+        $copy->bcc = array_map($ascii, $message->bcc);
+
+        return $copy;
+    }
+
+    /** @return list<string> every address of the message that is not plain ASCII */
+    private static function nonAsciiAddresses(PreparedMailMessage $message): array
+    {
+        $addresses = array_map(
+            static fn (MailRecipient $r): string => $r->email,
+            [$message->from, ...($message->replyTo === null ? [] : [$message->replyTo]), ...$message->to, ...$message->cc, ...$message->bcc],
+        );
+
+        return array_values(array_unique(array_filter($addresses, static fn (string $a): bool => preg_match('/[^\x00-\x7F]/', $a) === 1)));
     }
 
     /** A fully qualified domain name: dot-separated labels, a letters-only last one. */
