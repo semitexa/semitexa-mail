@@ -15,6 +15,7 @@ use Semitexa\Mail\Domain\Model\MailMessage;
 use Semitexa\Mail\Domain\Model\SensitiveMailBodies;
 use Semitexa\Mail\Domain\Contract\MailAttemptRepositoryInterface;
 use Semitexa\Mail\Domain\Contract\MailRetentionInterface;
+use Semitexa\Mail\Domain\Contract\MailOutcomeGuardInterface;
 use Semitexa\Mail\Domain\Contract\MailRepositoryInterface;
 use Semitexa\Mail\Domain\Contract\MailSendingClaimInterface;
 use Semitexa\Mail\Domain\Contract\MailerConfigResolverInterface;
@@ -249,7 +250,7 @@ final class MailWorker
             // A transport that cannot hold it back: delivered as before
             // rather than lost, at the risk of a second delivery.
         }
-        if (!$this->mailRepository->saveOutcomeUnlessSent($mailMessage)) {
+        if (!$this->saveOutcomeUnlessSent($mailMessage)) {
             $this->log("Mail message '{$message->messageId}' already sent — skipping.", 'info');
             return;
         }
@@ -373,13 +374,13 @@ final class MailWorker
                 'errorCode' => $result->errorCode,
                 'errorMessage' => $result->errorMessage,
             ]);
-            if (!$this->mailRepository->saveOutcomeUnlessSent($mailMessage)) {
+            if (!$this->saveOutcomeUnlessSent($mailMessage)) {
                 $this->log("Mail '{$message->messageId}' was sent by another worker meanwhile.", 'info');
                 return;
             }
             $requeueError = $this->requeueMessage($message, $config->queue);
             if ($requeueError !== null) {
-                if ($this->mailRepository->saveOutcomeUnlessSent($mailMessage->with([
+                if ($this->saveOutcomeUnlessSent($mailMessage->with([
                     'status' => MailMessageStatus::EnqueueFailed->value,
                     'errorCode' => MailErrorCode::QueueUnavailable->value,
                     'errorMessage' => "The retry could not be queued: {$requeueError}",
@@ -400,6 +401,17 @@ final class MailWorker
         $this->log("Mail '{$message->messageId}' failed permanently after {$attemptNo} attempt(s): {$result->errorMessage}", 'error');
     }
 
+    /** Without the guard (a project's own repository) the row is saved as it is. */
+    private function saveOutcomeUnlessSent(MailMessage $mailMessage): bool
+    {
+        if ($this->mailRepository instanceof MailOutcomeGuardInterface) {
+            return $this->mailRepository->saveOutcomeUnlessSent($mailMessage);
+        }
+        $this->mailRepository->save($mailMessage);
+
+        return true;
+    }
+
     private function failMessage(
         MailMessage $mailMessage,
         ?string $errorCode,
@@ -407,7 +419,7 @@ final class MailWorker
     ): void {
         // Never over a `sent` another worker wrote meanwhile; and then this
         // worker failed nothing, so it counts nothing.
-        if ($this->mailRepository->saveOutcomeUnlessSent($mailMessage->with([
+        if ($this->saveOutcomeUnlessSent($mailMessage->with([
             'status' => MailMessageStatus::Failed->value,
             'errorCode' => $errorCode,
             'errorMessage' => $errorMessage,

@@ -11,6 +11,9 @@ use Semitexa\Mail\Domain\Model\MailMessage;
 use Semitexa\Mail\Domain\Contract\MailRepositoryInterface;
 use Semitexa\Mail\Domain\Contract\MailRecoveryInterface;
 use Semitexa\Mail\Domain\Contract\MailSendingClaimInterface;
+use Semitexa\Mail\Domain\Contract\MailOutcomeGuardInterface;
+use Semitexa\Mail\Domain\Contract\MailResendClaimInterface;
+use Semitexa\Mail\Domain\Enum\MailMessageStatus;
 use Semitexa\Mail\Domain\Contract\MailRetentionInterface;
 use Semitexa\Orm\Application\Service\Uuid7;
 use Semitexa\Orm\OrmManager;
@@ -19,7 +22,7 @@ use Semitexa\Orm\Query\SystemScopeToken;
 use Semitexa\Orm\Repository\DomainRepository;
 
 #[SatisfiesRepositoryContract(of: MailRepositoryInterface::class)]
-class MailMessageRepository implements MailRepositoryInterface, MailRetentionInterface, MailRecoveryInterface, MailSendingClaimInterface
+class MailMessageRepository implements MailRepositoryInterface, MailRetentionInterface, MailRecoveryInterface, MailSendingClaimInterface, MailOutcomeGuardInterface, MailResendClaimInterface
 {
     #[InjectAsReadonly]
     protected OrmManager $orm;
@@ -40,7 +43,7 @@ class MailMessageRepository implements MailRepositoryInterface, MailRetentionInt
 
     public function findByIdempotencyKey(?string $tenantId, string $idempotencyKey): ?MailMessage
     {
-        if ($tenantId !== null) {
+        if ($tenantId !== null && $tenantId !== '') {
             /** @var MailMessage|null */
             return $this->repository()->forTenant($tenantId)->query()
                 ->where(MailMessageResource::column('idempotency_key'), Operator::Equals, $idempotencyKey)
@@ -123,6 +126,19 @@ class MailMessageRepository implements MailRepositoryInterface, MailRetentionInt
         $row = $this->orm()->getQueryAdapter()->execute('SELECT status FROM mail_messages WHERE id = :id', ['id' => $id])->rows[0] ?? null;
 
         return $row !== null && $row['status'] !== 'sent';
+    }
+
+    public function claimForResend(MailMessage $message): bool
+    {
+        return $this->orm()->getQueryAdapter()->execute(
+            'UPDATE mail_messages SET status = :pending, error_code = NULL, error_message = NULL, updated_at = :now WHERE id = :id AND status = :seen',
+            [
+                'pending' => MailMessageStatus::Pending->value,
+                'now' => (new \DateTimeImmutable('now', new \DateTimeZone('UTC')))->format('Y-m-d H:i:s'),
+                'id' => Uuid7::toBytes($message->getId()),
+                'seen' => $message->getStatus(),
+            ],
+        )->rowCount === 1;
     }
 
     public function claimAbandoned(MailMessage $message, \DateTimeImmutable $staleBefore): bool

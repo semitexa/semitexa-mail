@@ -18,6 +18,7 @@ use Semitexa\Mail\Domain\Model\MailMessage;
 use Semitexa\Mail\Domain\Model\SensitiveMailBodies;
 use Semitexa\Mail\Domain\Contract\MailAttemptRepositoryInterface;
 use Semitexa\Mail\Domain\Contract\MailRecoveryInterface;
+use Semitexa\Mail\Domain\Contract\MailResendClaimInterface;
 use Semitexa\Mail\Domain\Contract\MailRepositoryInterface;
 use Semitexa\Mail\Domain\Contract\MailServiceInterface;
 use Semitexa\Mail\Domain\Contract\MailTemplateRendererInterface;
@@ -81,7 +82,7 @@ final class MailService implements MailServiceInterface
 
         // The same key is the same mail: it is never stored twice.
         if ($envelope->idempotencyKey !== null) {
-            $existing = $this->mailRepository->findByIdempotencyKey($envelope->tenantId, $envelope->idempotencyKey);
+            $existing = $this->mailRepository->findByIdempotencyKey($envelope->tenantId ?? '', $envelope->idempotencyKey);
             if ($existing !== null) {
                 return $this->again($existing, $envelope, $options, $config);
             }
@@ -195,7 +196,7 @@ final class MailService implements MailServiceInterface
         } catch (ConstraintViolationException $e) {
             // A concurrent send() with the same key stored it first.
             $existing = $envelope->idempotencyKey !== null
-                ? $this->mailRepository->findByIdempotencyKey($envelope->tenantId, $envelope->idempotencyKey)
+                ? $this->mailRepository->findByIdempotencyKey($envelope->tenantId ?? '', $envelope->idempotencyKey)
                 : null;
             if ($existing === null) {
                 throw $e;
@@ -263,13 +264,32 @@ final class MailService implements MailServiceInterface
             // this process's own: another one would run a second chain, and
             // two workers would both deliver.
             MailMessageStatus::Deferred->value => $this->queueIsProcessLocal()
-                ? $this->deliverOrQueue($existing, $options, $config)
+                ? $this->resend($existing, $options, $config)
                 : new MailDispatchResult(status: MailDispatchStatus::Queued, messageId: $id),
-            default => in_array($existing->getErrorCode(), [MailErrorCode::InvalidRecipient->value, MailErrorCode::Provider5xx->value], true)
-                // Refused for good by the server: sending it again is refused again.
+            // Refused for good by the server, sending it again is refused
+            // again; with no reply after the message went out it may have
+            // arrived, and the transport says it is not sent again.
+            default => in_array($existing->getErrorCode(), [MailErrorCode::InvalidRecipient->value, MailErrorCode::Provider5xx->value, MailErrorCode::UnknownTransportError->value], true)
                 ? new MailDispatchResult(status: MailDispatchStatus::Failed, messageId: $id, errorCode: $existing->getErrorCode(), errorMessage: $existing->getErrorMessage())
-                : $this->deliverOrQueue($existing->with(['errorCode' => null, 'errorMessage' => null]), $options, $config),
+                : $this->resend($existing, $options, $config),
         };
+    }
+
+    /**
+     * One resend of a failed or deferred row: it is taken back to `pending`
+     * first, so of two send() calls retrying the key at once, one delivers
+     * and the other answers Queued. Both used to deliver it.
+     */
+    private function resend(MailMessage $existing, MailSendOptions $options, MailerConfig $config): MailDispatchResult
+    {
+        if (!$this->mailRepository instanceof MailResendClaimInterface) {
+            return $this->deliverOrQueue($existing->with(['errorCode' => null, 'errorMessage' => null]), $options, $config);
+        }
+        if (!$this->mailRepository->claimForResend($existing)) {
+            return new MailDispatchResult(status: MailDispatchStatus::Queued, messageId: $existing->getId());
+        }
+
+        return $this->takeOver($existing->with(['status' => MailMessageStatus::Pending->value, 'errorCode' => null, 'errorMessage' => null]), $options, $config);
     }
 
     /**

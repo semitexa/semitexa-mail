@@ -359,6 +359,41 @@ final class MailServiceTest extends TestCase
         self::assertSame('sent', $this->messages->byId($retried->messageId)?->getStatus());
     }
 
+    /** Two send() calls retrying one failed key at once both delivered it. */
+    #[Test]
+    public function of_two_resends_of_a_failed_mail_one_delivers_it(): void
+    {
+        MailTransportRegistry::register(new MailServiceScriptedTransport(new MailTransportResult(status: MailTransportStatus::Rejected, errorCode: 'mailbox_full', errorMessage: '552 mailbox full')));
+        $envelope = $this->envelope(subject: 'Receipt', text: 'Paid');
+        $envelope->idempotencyKey = 'order-44-receipt';
+        $failed = $this->service(driver: 'scripted')->send($envelope, $this->now());
+        $row = $this->messages->byId($failed->messageId);
+        self::assertSame('failed', $row?->getStatus());
+
+        // The other caller read the same failed row and claims it first.
+        self::assertTrue($this->messages->claimForResend($row));
+        $second = $this->service()->send(clone $envelope, $this->now());
+
+        self::assertSame(MailDispatchStatus::Queued, $second->status);
+        self::assertSame(0, $this->fake->count(), 'the second resend delivered nothing');
+    }
+
+    /** No reply after the message went out: it may have arrived, and the transport says it is not sent again. */
+    #[Test]
+    public function a_mail_whose_outcome_is_unknown_is_not_sent_again_under_its_key(): void
+    {
+        MailTransportRegistry::register(new MailServiceScriptedTransport(new MailTransportResult(status: MailTransportStatus::Failed, errorCode: 'unknown_transport_error', errorMessage: 'No reply after the message was sent')));
+        $envelope = $this->envelope(subject: 'Receipt', text: 'Paid');
+        $envelope->idempotencyKey = 'order-45-receipt';
+
+        $first = $this->service(driver: 'scripted')->send($envelope, $this->now());
+        $again = $this->service()->send(clone $envelope, $this->now());
+
+        self::assertSame(MailDispatchStatus::Failed, $again->status);
+        self::assertSame('unknown_transport_error', $again->errorCode);
+        self::assertSame(0, $this->fake->count());
+    }
+
     #[Test]
     public function a_mail_the_server_refused_for_good_is_not_sent_again_under_its_key(): void
     {
@@ -902,7 +937,7 @@ final class MailServiceRenderer implements MailTemplateRendererInterface
     }
 }
 
-final class MailServiceMessages implements MailRepositoryInterface, MailRecoveryInterface, \Semitexa\Mail\Domain\Contract\MailSendingClaimInterface
+final class MailServiceMessages implements MailRepositoryInterface, MailRecoveryInterface, \Semitexa\Mail\Domain\Contract\MailSendingClaimInterface, \Semitexa\Mail\Domain\Contract\MailOutcomeGuardInterface, \Semitexa\Mail\Domain\Contract\MailResendClaimInterface
 {
     /** @var array<string, MailMessage> */
     private array $byId = [];
@@ -941,7 +976,8 @@ final class MailServiceMessages implements MailRepositoryInterface, MailRecovery
     public function findByIdempotencyKey(?string $tenantId, string $idempotencyKey): ?MailMessage
     {
         foreach ($this->byId as $message) {
-            if ($message->getTenantId() === $tenantId && $message->getIdempotencyKey() === $idempotencyKey) {
+            // '' is system mail, as the real repository reads it.
+            if (($message->getTenantId() ?? '') === ($tenantId ?? '') && $message->getIdempotencyKey() === $idempotencyKey) {
                 return $message;
             }
         }
@@ -980,6 +1016,17 @@ final class MailServiceMessages implements MailRepositoryInterface, MailRecovery
 
     /** What happens right after a successful claim: another delivery reaching the row. */
     public ?\Closure $afterClaim = null;
+
+    public function claimForResend(MailMessage $message): bool
+    {
+        $row = $this->byId[$message->getId()] ?? null;
+        if ($row === null || $row->getStatus() !== $message->getStatus()) {
+            return false;
+        }
+        $this->byId[$row->getId()] = $row->with(['status' => 'pending', 'errorCode' => null, 'errorMessage' => null]);
+
+        return true;
+    }
 
     public function takeForDelivery(MailMessage $message): bool
     {
