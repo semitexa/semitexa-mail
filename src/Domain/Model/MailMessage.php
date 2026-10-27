@@ -225,8 +225,9 @@ final readonly class MailMessage
             templateHandle: $this->templateHandle,
             fromName: $this->fromName,
             replyTo: $this->replyTo,
-            htmlBody: $this->htmlBody,
-            textBody: $this->textBody,
+            // Only ever to erase them ({@see SensitiveMailBodies}).
+            htmlBody: $str('htmlBody', $this->htmlBody),
+            textBody: $str('textBody', $this->textBody),
             headers: $this->headers,
             tags: $this->tags,
             metadata: $this->metadata,

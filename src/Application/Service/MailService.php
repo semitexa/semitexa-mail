@@ -15,6 +15,7 @@ use Semitexa\Orm\Exception\ConstraintViolationException;
 use Semitexa\Orm\OrmManager;
 use Semitexa\Mail\Domain\Model\MailAttempt;
 use Semitexa\Mail\Domain\Model\MailMessage;
+use Semitexa\Mail\Domain\Model\SensitiveMailBodies;
 use Semitexa\Mail\Domain\Contract\MailAttemptRepositoryInterface;
 use Semitexa\Mail\Domain\Contract\MailRecoveryInterface;
 use Semitexa\Mail\Domain\Contract\MailRepositoryInterface;
@@ -185,7 +186,7 @@ final class MailService implements MailServiceInterface
             textBody: $textBody,
             headers: $envelope->headers,
             tags: $envelope->tags,
-            metadata: $envelope->metadata,
+            metadata: $envelope->sensitive ? [SensitiveMailBodies::METADATA_KEY => true] + $envelope->metadata : $envelope->metadata,
             attachments: array_map($this->serializeAttachment(...), $envelope->attachments),
             idempotencyKey: $envelope->idempotencyKey,
             mailerKey: $envelope->mailerKey,
@@ -477,7 +478,7 @@ final class MailService implements MailServiceInterface
             default                       => MailMessageStatus::Failed,
         };
 
-        $this->mailRepository->save($mailMessage->with([
+        $this->mailRepository->save(($finalStatus === MailMessageStatus::Sent ? SensitiveMailBodies::erasedIfSensitive($mailMessage) : $mailMessage)->with([
             'status' => $finalStatus->value,
             'providerMessageId' => $result->providerMessageId,
             'errorCode' => $result->errorCode,

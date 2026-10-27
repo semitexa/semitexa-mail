@@ -94,6 +94,25 @@ final class MailServiceTest extends TestCase
         self::assertCount(1, $this->attempts->saved, 'every delivery attempt is recorded');
     }
 
+    /** The stored row kept a live reset link where every operator screen and backup could read it. */
+    #[Test]
+    public function a_sensitive_mail_is_sent_whole_and_its_stored_bodies_are_erased(): void
+    {
+        $envelope = $this->envelope(subject: 'Reset', text: 'https://example.test/reset?token=secret');
+        $envelope->sensitive = true;
+
+        $result = $this->service()->send($envelope, $this->now());
+
+        self::assertSame('https://example.test/reset?token=secret', $this->fake->getLastMessage()?->textBody, 'the recipient gets the link');
+        $row = $this->messages->byId($result->messageId);
+        self::assertSame('sent', $row?->getStatus());
+        self::assertSame(\Semitexa\Mail\Domain\Model\SensitiveMailBodies::ERASED, $row?->getTextBody());
+        self::assertSame('Reset', $row?->getSubject(), 'only the bodies go');
+
+        $plain = $this->service()->send($this->envelope(subject: 'Hi', text: 'Hello'), $this->now());
+        self::assertSame('Hello', $this->messages->byId($plain->messageId)?->getTextBody(), 'an ordinary mail keeps its body');
+    }
+
     /** Sent in the call, a rolled-back order still mailed its customer, and a replayed one mailed them twice. */
     #[Test]
     public function inside_a_transaction_the_mail_leaves_only_once_it_commits(): void

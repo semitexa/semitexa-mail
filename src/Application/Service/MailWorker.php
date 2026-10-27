@@ -12,6 +12,7 @@ use Semitexa\Core\Queue\QueueStopSignals;
 use Semitexa\Core\Queue\QueueTransportRegistry;
 use Semitexa\Mail\Domain\Model\MailAttempt;
 use Semitexa\Mail\Domain\Model\MailMessage;
+use Semitexa\Mail\Domain\Model\SensitiveMailBodies;
 use Semitexa\Mail\Domain\Contract\MailAttemptRepositoryInterface;
 use Semitexa\Mail\Domain\Contract\MailRetentionInterface;
 use Semitexa\Mail\Domain\Contract\MailRepositoryInterface;
@@ -337,7 +338,7 @@ final class MailWorker
         };
 
         if ($result->status === MailTransportStatus::Accepted) {
-            $this->mailRepository->save($mailMessage->with([
+            $this->mailRepository->save(SensitiveMailBodies::erasedIfSensitive($mailMessage)->with([
                 'status' => MailMessageStatus::Sent->value,
                 'providerMessageId' => $result->providerMessageId,
                 'errorCode' => null,

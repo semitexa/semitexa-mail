@@ -43,4 +43,11 @@ final class MailEnvelope
 
     /** @var list<string> */
     public array $tags = [];
+
+    /**
+     * The bodies carry a secret (a reset link, a sign-in code): kept while
+     * the mail waits, erased from the stored row once it is sent. The row is
+     * read by every operator screen and backup; the link worked from there.
+     */
+    public bool $sensitive = false;
 }
