@@ -10,6 +10,16 @@ use Semitexa\Mail\Domain\Model\ResolvedAttachment;
 
 final class MimeBuilder
 {
+    /** RFC 5322 2.1.1: a line holds at most 998 characters before its CRLF. */
+    private const int MAX_LINE = 998;
+
+    /**
+     * The percent-encoded file name, at most: beside the quoted ASCII form
+     * (160 with every character escaped) and the parameter text, the
+     * Content-Disposition line stays under MAX_LINE with room for a long type.
+     */
+    private const int MAX_ENCODED_FILENAME = 600;
+
     /**
      * Builds the full MIME message including headers and body.
      *
@@ -171,10 +181,16 @@ final class MimeBuilder
         $clean = (string) preg_replace('/[\x00-\x1F\x7F]/', '', $filename);
         // Long enough for any real name, short enough that both forms stay
         // well inside the 998-octet line limit (no RFC 2231 continuations).
-        if (mb_strlen($clean, 'UTF-8') > 80) {
+        // Bounded in encoded bytes too: eighty emoji are 960 of them
+        // percent-encoded, and the header line went past 998.
+        if (mb_strlen($clean, 'UTF-8') > 80 || strlen(rawurlencode($clean)) > self::MAX_ENCODED_FILENAME) {
             $extension = pathinfo($clean, PATHINFO_EXTENSION);
             $keep = $extension !== '' && mb_strlen($extension, 'UTF-8') <= 10 ? '.' . $extension : '';
-            $clean = mb_substr($clean, 0, 80 - mb_strlen($keep, 'UTF-8'), 'UTF-8') . $keep;
+            $length = 80 - mb_strlen($keep, 'UTF-8');
+            do {
+                $cut = mb_substr($clean, 0, $length--, 'UTF-8') . $keep;
+            } while ($length > 0 && strlen(rawurlencode($cut)) > self::MAX_ENCODED_FILENAME);
+            $clean = $cut;
         }
         // One underscore per character, not per byte, where it is UTF-8.
         $ascii = (string) (preg_replace('/[^\x20-\x7E]/u', '_', $clean) ?? preg_replace('/[^\x20-\x7E]/', '_', $clean));
@@ -210,7 +226,16 @@ final class MimeBuilder
         // line, past the 998 a line may hold. Folded at spaces, which
         // unfolding gives back.
         if ($lineUsed + strlen($value) > 78) {
-            return wordwrap($value, 76, "\r\n ", false);
+            $folded = wordwrap($value, 76, "\r\n ", false);
+            // A run with no space to fold at (a 1 000-character token) stayed
+            // one line past 998: encoded-words split anywhere.
+            $lines = explode("\r\n", $folded);
+            $lines[0] = str_repeat(' ', $lineUsed) . $lines[0];
+            if (max(array_map('strlen', $lines)) > self::MAX_LINE) {
+                return EncodedWord::encode($value, $lineUsed);
+            }
+
+            return $folded;
         }
         return $value;
     }

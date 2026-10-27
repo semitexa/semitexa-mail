@@ -15,10 +15,26 @@ use Semitexa\Mail\Domain\Model\PreparedMailMessage;
 /** Small mail defects found writing runtime/mail.md. */
 final class MailSmallFixesTest extends TestCase
 {
+    private string|false $encryption = false;
+
+    /** @var array<string, mixed> MailTransportRegistry's statics as the test found them */
+    private array $transports = [];
+
+    protected function setUp(): void
+    {
+        $this->encryption = getenv('MAIL_ENCRYPTION');
+        foreach ((new \ReflectionClass(MailTransportRegistry::class))->getProperties(\ReflectionProperty::IS_STATIC) as $property) {
+            $this->transports[$property->getName()] = $property->getValue();
+        }
+    }
+
     protected function tearDown(): void
     {
-        MailTransportRegistry::reset();
-        putenv('MAIL_ENCRYPTION');
+        // Put back, not cleared: what was set before this class is there for the tests after it.
+        foreach ($this->transports as $name => $value) {
+            (new \ReflectionProperty(MailTransportRegistry::class, $name))->setValue(null, $value);
+        }
+        putenv($this->encryption === false ? 'MAIL_ENCRYPTION' : 'MAIL_ENCRYPTION=' . $this->encryption);
     }
 
     #[Test]
@@ -224,6 +240,35 @@ final class MailSmallFixesTest extends TestCase
 
         self::assertSame('accepted', $result->status->value, (string) $result->errorMessage);
         self::assertSame('Not delivered to: typo@nowhere.test (550-5.1.1 Empf?nger 550 5.1.1 unbekannt)', $result->errorMessage);
+    }
+
+    /**
+     * Hundreds of refused addresses went past error_message's 65 535 bytes:
+     * the sent row could not be saved, stayed `sending`, and a resend
+     * delivered the mail again.
+     */
+    #[Test]
+    public function the_list_of_refused_recipients_fits_the_error_message_column(): void
+    {
+        $message = $this->message();
+        $refusals = [];
+        foreach (range(1, 300) as $i) {
+            $message->bcc[] = new MailRecipient("user{$i}@nowhere.test");
+            $refusals["user{$i}@nowhere.test"] = '550 5.1.1 ' . str_repeat('no such user here ', 14);
+        }
+        [$process, $port] = self::smtpServer($refusals);
+        try {
+            $result = (new \Semitexa\Mail\Application\Service\SmtpMailTransport())->deliver($message, new \Semitexa\Mail\Domain\Model\MailerConfig(host: '127.0.0.1', port: $port, timeoutSeconds: 5));
+        } finally {
+            proc_terminate($process);
+            proc_close($process);
+        }
+
+        self::assertSame('accepted', $result->status->value);
+        self::assertSame(\Semitexa\Mail\Application\Service\SmtpMailTransport::MAX_ERROR_MESSAGE, strlen((string) $result->errorMessage));
+        self::assertStringStartsWith('Not delivered to: user1@nowhere.test (550 5.1.1', (string) $result->errorMessage);
+        self::assertStringEndsWith(' … (truncated)', (string) $result->errorMessage);
+        self::assertCount(300, $result->providerResponse['refused_recipients'] ?? [], 'every address is still in the response');
     }
 
     /** An address that is not ASCII went out as raw 8-bit bytes to any server. */

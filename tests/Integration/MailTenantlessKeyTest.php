@@ -46,7 +46,9 @@ final class MailTenantlessKeyTest extends TestCase
         $first = $repository->save($this->message($key));
         $this->ids[] = $first->getId();
 
-        self::assertNull($repository->findById($first->getId())?->getTenantId(), 'still no tenant in the domain');
+        $loaded = $repository->findById($first->getId());
+        self::assertNotNull($loaded, 'the row is loadable by id');
+        self::assertNull($loaded->getTenantId(), 'still no tenant in the domain');
         self::assertSame($first->getId(), $repository->findByIdempotencyKey(null, $key)?->getId());
 
         $this->expectException(\Semitexa\Orm\Exception\ConstraintViolationException::class);

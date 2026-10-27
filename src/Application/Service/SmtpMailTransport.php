@@ -28,6 +28,11 @@ final class SmtpMailTransport implements MailTransportInterface
      */
     private const FINAL_REPLY_SECONDS = 240;
 
+    /** A MySQL TEXT column (error_message) holds 65 535 bytes. */
+    public const int MAX_ERROR_MESSAGE = 65535;
+
+    private const string TRUNCATED = ' … (truncated)';
+
     public function __construct()
     {
         $this->mimeBuilder = new MimeBuilder();
@@ -104,7 +109,7 @@ final class SmtpMailTransport implements MailTransportInterface
                 // MAIL_ENCRYPTION was empty, its default. A local relay (this
                 // machine, a compose service) is let through; anything else
                 // needs TLS or MAIL_ALLOW_PLAINTEXT_AUTH=1.
-                if ($encryption === null && !self::isLocalRelay($config->host) && !self::plaintextAuthAllowed()) {
+                if ($encryption === null && !self::isLocalRelay($config->host, (string) stream_socket_get_name($socket, true)) && !self::plaintextAuthAllowed()) {
                     throw new MailTlsException("Not signing in to {$config->host} without TLS: the password would cross the network in plain text. Set MAIL_ENCRYPTION=tls (or ssl), or MAIL_ALLOW_PLAINTEXT_AUTH=1 for a trusted network.");
                 }
                 $this->authenticate($socket, $config->username, $config->password, $ehlo);
@@ -193,16 +198,26 @@ final class SmtpMailTransport implements MailTransportInterface
             } catch (\Throwable) {
             }
 
+            $notDelivered = $refused === [] ? null : 'Not delivered to: ' . implode('; ', array_map(
+                // The reply starts with its code.
+                static fn (array $r): string => "{$r['email']} ({$r['smtp_response']})",
+                $refused,
+            ));
+            // error_message is a TEXT column: a few hundred refused addresses
+            // went past it, the save of the sent row failed, the row stayed
+            // `sending` and a resend delivered the mail again. Cut between
+            // characters (a stored address may be UTF-8); every address is
+            // still in providerResponse.
+            if ($notDelivered !== null && strlen($notDelivered) > self::MAX_ERROR_MESSAGE) {
+                $notDelivered = mb_strcut($notDelivered, 0, self::MAX_ERROR_MESSAGE - strlen(self::TRUNCATED), 'UTF-8') . self::TRUNCATED;
+            }
+
             return new MailTransportResult(
                 status: MailTransportStatus::Accepted,
                 providerMessageId: $message->messageId,
                 // Said on the message row, which still reads sent: a refused
                 // cc showed nowhere anyone looks.
-                errorMessage: $refused === [] ? null : 'Not delivered to: ' . implode('; ', array_map(
-                    // The reply starts with its code.
-                    static fn (array $r): string => "{$r['email']} ({$r['smtp_response']})",
-                    $refused,
-                )),
+                errorMessage: $notDelivered,
                 providerStatus: $refused === [] ? 'sent' : 'sent_partially',
                 providerResponse: ['smtp_response' => $dataResponse] + ($refused === [] ? [] : ['refused_recipients' => $refused]),
             );
@@ -434,13 +449,26 @@ final class SmtpMailTransport implements MailTransportInterface
         return preg_match('/^(?=.{1,253}$)([A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+[A-Za-z]{2,63}$/', $name) === 1;
     }
 
-    /** This machine, or a one-word host (a compose service on the same network). */
-    public static function isLocalRelay(string $host): bool
+    /**
+     * This machine, or a one-word host (a compose service on the same
+     * network) — reached at an address that is not public. A one-word name
+     * alone proved nothing: a resolver's search domain can turn `smtp` into
+     * a server across the internet, and the password went to it in plain text.
+     *
+     * @param string $peer the connected address, "ip:port" or "[ip]:port"
+     */
+    public static function isLocalRelay(string $host, string $peer): bool
     {
         $host = strtolower(trim($host, '[] '));
-
-        return in_array($host, ['localhost', '127.0.0.1', '::1'], true)
+        $named = in_array($host, ['localhost', '127.0.0.1', '::1'], true)
             || (filter_var($host, FILTER_VALIDATE_IP) === false && !str_contains($host, '.'));
+        $colon = strrpos($peer, ':');
+        $ip = trim($colon === false ? $peer : substr($peer, 0, $colon), '[]');
+
+        // Loopback, private and link-local addresses fail the public check.
+        return $named
+            && filter_var($ip, FILTER_VALIDATE_IP) !== false
+            && filter_var($ip, FILTER_VALIDATE_IP, FILTER_FLAG_NO_PRIV_RANGE | FILTER_FLAG_NO_RES_RANGE) === false;
     }
 
     private static function plaintextAuthAllowed(): bool

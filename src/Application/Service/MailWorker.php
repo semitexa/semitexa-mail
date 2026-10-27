@@ -349,8 +349,9 @@ final class MailWorker
             $attemptNo = $recordAttempt();
             $this->outcome = 'processed';
             $this->log("Mail '{$message->messageId}' sent (attempt {$attemptNo}).", 'success');
-            if ($result->errorMessage !== null) {
-                $this->log("Mail '{$message->messageId}': {$result->errorMessage}", 'warning');
+            $warning = $result->warningForLog();
+            if ($warning !== null) {
+                $this->log("Mail '{$message->messageId}': {$warning}", 'warning');
             }
             return;
         }
@@ -461,6 +462,10 @@ final class MailWorker
             $retried             = clone $message;
             $retried->attempts   = $message->attempts + 1;
             $retried->queuedAt   = date(DATE_ATOM);
+            // A retry of a takeover copy is this worker's own: still marked,
+            // it met the `deferred` row this worker wrote, stopped there as
+            // finished by its holder, and the mail was never tried again.
+            $retried->takeoverOnly = false;
 
             $transport = QueueTransportRegistry::create(
                 $this->currentTransport ?? QueueConfig::defaultTransport(),

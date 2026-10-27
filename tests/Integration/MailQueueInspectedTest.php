@@ -20,10 +20,26 @@ final class MailQueueInspectedTest extends TestCase
 {
     private const TRANSPORT = 'mail-inspected-test';
 
+    private string|false $eventsTransport = false;
+
+    /** @var array<string, mixed> QueueTransportRegistry's statics as the test found them */
+    private array $registry = [];
+
+    protected function setUp(): void
+    {
+        $this->eventsTransport = getenv('EVENTS_TRANSPORT');
+        foreach ((new \ReflectionClass(QueueTransportRegistry::class))->getProperties(\ReflectionProperty::IS_STATIC) as $property) {
+            $this->registry[$property->getName()] = $property->getValue();
+        }
+    }
+
     protected function tearDown(): void
     {
-        putenv('EVENTS_TRANSPORT');
-        QueueTransportRegistry::reset();
+        // Put back, not cleared: what was set before this class is there for the tests after it.
+        putenv($this->eventsTransport === false ? 'EVENTS_TRANSPORT' : 'EVENTS_TRANSPORT=' . $this->eventsTransport);
+        foreach ($this->registry as $name => $value) {
+            (new \ReflectionProperty(QueueTransportRegistry::class, $name))->setValue(null, $value);
+        }
     }
 
     #[Test]

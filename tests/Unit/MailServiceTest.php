@@ -56,8 +56,14 @@ final class MailServiceTest extends TestCase
 
     private string|false $eventsTransport = false;
 
+    /** @var array<class-string, array<string, mixed>> the process-global registries as the test found them */
+    private array $registries = [];
+
     protected function setUp(): void
     {
+        foreach ([MailTransportRegistry::class, QueueTransportRegistry::class, \Semitexa\Core\Log\StaticLoggerBridge::class] as $class) {
+            $this->registries[$class] = self::statics($class);
+        }
         MailTransportRegistry::reset();
         $this->fake = new FakeMailTransport();
         MailTransportRegistry::register($this->fake);
@@ -66,14 +72,20 @@ final class MailServiceTest extends TestCase
         QueueTransportRegistry::reset();
         MailServiceQueueSpy::$published = [];
         MailServiceQueueSpy::$refuse = false;
+        MailServiceConfig::$mailerKeys = [];
         $this->eventsAsync = getenv('EVENTS_ASYNC');
         $this->eventsTransport = getenv('EVENTS_TRANSPORT');
     }
 
     protected function tearDown(): void
     {
-        MailTransportRegistry::reset();
-        QueueTransportRegistry::reset();
+        // Put back, not reset: a registration made before this class ran
+        // is still there for the tests after it.
+        foreach ($this->registries as $class => $values) {
+            foreach ($values as $name => $value) {
+                (new \ReflectionProperty($class, $name))->setValue(null, $value);
+            }
+        }
         putenv($this->eventsTransport === false ? 'EVENTS_TRANSPORT' : 'EVENTS_TRANSPORT=' . $this->eventsTransport);
         putenv($this->eventsAsync === false ? 'EVENTS_ASYNC' : 'EVENTS_ASYNC=' . $this->eventsAsync);
     }
@@ -105,9 +117,10 @@ final class MailServiceTest extends TestCase
 
         self::assertSame('https://example.test/reset?token=secret', $this->fake->getLastMessage()?->textBody, 'the recipient gets the link');
         $row = $this->messages->byId($result->messageId);
-        self::assertSame('sent', $row?->getStatus());
-        self::assertSame(\Semitexa\Mail\Domain\Model\SensitiveMailBodies::ERASED, $row?->getTextBody());
-        self::assertSame('Reset', $row?->getSubject(), 'only the bodies go');
+        self::assertNotNull($row);
+        self::assertSame('sent', $row->getStatus());
+        self::assertSame(\Semitexa\Mail\Domain\Model\SensitiveMailBodies::ERASED, $row->getTextBody());
+        self::assertSame('Reset', $row->getSubject(), 'only the bodies go');
 
         $plain = $this->service()->send($this->envelope(subject: 'Hi', text: 'Hello'), $this->now());
         self::assertSame('Hello', $this->messages->byId($plain->messageId)?->getTextBody(), 'an ordinary mail keeps its body');
@@ -163,11 +176,15 @@ final class MailServiceTest extends TestCase
             updatedAt: new \DateTimeImmutable('-1 hour'),
         ));
         // Between the claim and the claimant's delivery, a held-back delivery takes the row.
-        $this->messages->afterClaim = fn (MailServiceMessages $m): bool => $m->takeForDelivery($m->byId('receipt-old'));
+        $takenByHeldBack = false;
+        $this->messages->afterClaim = function (MailServiceMessages $m) use (&$takenByHeldBack): void {
+            $takenByHeldBack = $m->takeForDelivery($m->byId('receipt-old') ?? throw new \LogicException('receipt-old is not stored'));
+        };
         $envelope = $this->envelope(subject: 'Receipt', text: 'Paid');
         $envelope->idempotencyKey = 'receipt-old';
 
         self::assertSame(MailDispatchStatus::Queued, $this->service()->send($envelope, $this->now())->status);
+        self::assertTrue($takenByHeldBack, 'the claim succeeded, and the held-back delivery took the row after it');
         self::assertSame(0, $this->fake->count(), 'the held-back delivery sends it, not the claimant');
     }
 
@@ -241,6 +258,23 @@ final class MailServiceTest extends TestCase
         self::assertSame(MailDispatchStatus::Failed, $result->status);
         self::assertSame('invalid_recipient', $result->errorCode);
         self::assertNull($result->messageId);
+        self::assertSame(0, $this->messages->count(), 'nothing stored');
+        self::assertSame(0, $this->fake->count());
+    }
+
+    /** A recipient's name that is not UTF-8 threw a JsonException out of send() as the row was stored. */
+    #[Test]
+    public function a_recipient_name_that_is_not_utf8_fails_the_mail_before_anything_is_stored(): void
+    {
+        $envelope = $this->envelope(subject: 'x', text: 'y');
+        $envelope->cc = [new MailRecipient('bob@example.test', "Bob \xFF")];
+
+        $result = $this->service()->send($envelope, $this->now());
+
+        self::assertSame(MailDispatchStatus::Failed, $result->status);
+        self::assertSame('invalid_message', $result->errorCode);
+        self::assertSame('The name of cc recipient bob@example.test is not valid UTF-8.', $result->errorMessage);
+        self::assertSame(0, $this->messages->count(), 'nothing stored');
         self::assertSame(0, $this->fake->count());
     }
 
@@ -305,10 +339,16 @@ final class MailServiceTest extends TestCase
         $envelope->tenantId = 'acme';
         MailServiceRenderer::$flagSubject = null;
 
-        $this->service()->send($envelope, $this->now());
+        // Sent from inside another subject's render: that one is put back, not cleared.
+        $after = \Semitexa\Core\Feature\CurrentFeatureFlags::forSubjectDuring('globex', 'user-7', function () use ($envelope): ?array {
+            $this->service()->send($envelope, $this->now());
+
+            return \Semitexa\Core\Feature\CurrentFeatureFlags::subject();
+        });
 
         self::assertSame(['acme', null], MailServiceRenderer::$flagSubject);
-        self::assertNull(\Semitexa\Core\Feature\CurrentFeatureFlags::subject(), 'put back after the render');
+        self::assertSame(['globex', 'user-7'], $after, 'the sender\'s subject is put back after the render');
+        self::assertNull(\Semitexa\Core\Feature\CurrentFeatureFlags::subject());
     }
 
     #[Test]
@@ -370,10 +410,13 @@ final class MailServiceTest extends TestCase
         $row = $this->messages->byId($failed->messageId);
         self::assertSame('failed', $row?->getStatus());
 
-        // The other caller read the same failed row and claims it first.
+        // The other caller read the same failed row and claims it first; this
+        // one read it before that claim, and still sees it failed.
         self::assertTrue($this->messages->claimForResend($row));
+        $this->messages->staleRead = $row;
         $second = $this->service()->send(clone $envelope, $this->now());
 
+        self::assertNull($this->messages->staleRead, 'the second resend read the failed row');
         self::assertSame(MailDispatchStatus::Queued, $second->status);
         self::assertSame(0, $this->fake->count(), 'the second resend delivered nothing');
     }
@@ -578,7 +621,7 @@ final class MailServiceTest extends TestCase
 
         $this->worker()->processPayload(MailServiceQueueSpy::$published[0][1]);
 
-        self::assertContains('marketing', MailServiceConfig::$mailerKeys);
+        self::assertSame(['marketing'], MailServiceConfig::$mailerKeys, 'resolved once, with the sender\'s mailer');
     }
 
     #[Test]
@@ -609,14 +652,15 @@ final class MailServiceTest extends TestCase
         putenv('EVENTS_TRANSPORT=mail-test-delayed');
         MailServiceDelayedQueueSpy::$delayed = [];
 
-        $this->worker()->processPayload((new QueuedMailMessage(messageId: 'not-committed-yet'))->toJson());
+        $queuedAt = date(DATE_ATOM, time() - 10);
+        $this->worker()->processPayload((new QueuedMailMessage(messageId: 'not-committed-yet', queuedAt: $queuedAt))->toJson());
         $this->worker()->processPayload((new QueuedMailMessage(messageId: 'rolled-back', queuedAt: date(DATE_ATOM, time() - 60)))->toJson());
 
         self::assertCount(1, MailServiceDelayedQueueSpy::$delayed, 'the fresh one only');
         self::assertStringContainsString('not-committed-yet', MailServiceDelayedQueueSpy::$delayed[0][1]);
         self::assertSame(3, MailServiceDelayedQueueSpy::$delayed[0][2]);
         $again = QueuedMailMessage::fromJson(MailServiceDelayedQueueSpy::$delayed[0][1]);
-        self::assertGreaterThan(time() - 30, strtotime($again->queuedAt), 'queuedAt kept, so the looking stops');
+        self::assertSame($queuedAt, $again->queuedAt, 'queuedAt kept, so the looking stops');
     }
 
     /**
@@ -845,6 +889,68 @@ final class MailServiceTest extends TestCase
         self::assertSame([], MailServiceQueueSpy::$published);
     }
 
+    /** A takeover copy's retry kept its mark, met the `deferred` row its own worker wrote, and stopped there: never tried again. */
+    #[Test]
+    public function the_retry_of_a_takeover_copy_is_delivered(): void
+    {
+        $this->spyOnTheQueue();
+        $id = $this->queuedMessage();
+        // The worker that held it died mid-send.
+        $this->messages->save(($this->messages->byId($id) ?? self::fail('not stored'))->with(['status' => 'sending']));
+        MailTransportRegistry::register(new MailServiceScriptedTransport(new MailTransportResult(status: MailTransportStatus::Failed, errorCode: 'timeout', errorMessage: 'SMTP timed out')));
+
+        $this->worker(driver: 'scripted')->processPayload((new QueuedMailMessage(messageId: $id, maxRetries: 2, retryDelay: 0, takeoverOnly: true))->toJson());
+
+        self::assertSame('deferred', $this->messages->byId($id)?->getStatus());
+        self::assertCount(1, MailServiceQueueSpy::$published);
+        $retry = QueuedMailMessage::fromJson(MailServiceQueueSpy::$published[0][1]);
+        self::assertFalse($retry->takeoverOnly, 'the retry is this worker\'s own');
+        self::assertSame(1, $retry->attempts);
+
+        $this->worker()->processPayload($retry->toJson());
+
+        self::assertSame(1, $this->fake->count());
+        self::assertSame('sent', $this->messages->byId($id)?->getStatus());
+    }
+
+    /** A partial refusal's warning named every refused address and the server's reply in the log. */
+    #[Test]
+    public function a_partial_refusal_is_logged_as_a_count_not_the_addresses(): void
+    {
+        $partial = new MailTransportResult(
+            status: MailTransportStatus::Accepted,
+            errorMessage: 'Not delivered to: typo@nowhere.test (550 5.1.1 no such user)',
+            providerStatus: 'sent_partially',
+            providerResponse: ['refused_recipients' => [['email' => 'typo@nowhere.test', 'smtp_code' => 550, 'smtp_response' => '550 5.1.1 no such user']]],
+        );
+        MailTransportRegistry::register(new MailServiceScriptedTransport($partial));
+        $logged = new MailServiceLog();
+        \Semitexa\Core\Log\StaticLoggerBridge::set($logged);
+
+        $sync = $this->service(driver: 'scripted')->send($this->envelope(subject: 'Hi', text: 'x'), $this->now());
+        $this->spyOnTheQueue();
+        $id = $this->queuedMessage();
+        $output = new \Symfony\Component\Console\Output\BufferedOutput();
+        $worker = $this->worker(driver: 'scripted');
+        $worker->setOutput($output);
+        $worker->processPayload((new QueuedMailMessage(messageId: $id))->toJson());
+
+        self::assertSame(["Mail '{$sync->messageId}': 1 recipient(s) refused; who and why is on the mail row."], $logged->warnings);
+        self::assertStringContainsString("Mail '{$id}': 1 recipient(s) refused; who and why is on the mail row.", $output->fetch());
+        self::assertSame($partial->errorMessage, $this->messages->byId($id)?->getErrorMessage(), 'the row still names them');
+    }
+
+    /** @return array<string, mixed> every static property of $class, as it is now */
+    private static function statics(string $class): array
+    {
+        $values = [];
+        foreach ((new \ReflectionClass($class))->getProperties(\ReflectionProperty::IS_STATIC) as $property) {
+            $values[$property->getName()] = $property->getValue();
+        }
+
+        return $values;
+    }
+
     private function spyOnTheQueue(): void
     {
         QueueTransportRegistry::register('mail-test-spy', new MailServiceQueueSpyFactory());
@@ -973,8 +1079,16 @@ final class MailServiceMessages implements MailRepositoryInterface, MailRecovery
         return $this->byId[(string) $id] ?? null;
     }
 
+    /** Answered once by the next key lookup: a row as another caller read it before a change. */
+    public ?MailMessage $staleRead = null;
+
     public function findByIdempotencyKey(?string $tenantId, string $idempotencyKey): ?MailMessage
     {
+        if ($this->staleRead !== null) {
+            [$stale, $this->staleRead] = [$this->staleRead, null];
+
+            return $stale;
+        }
         foreach ($this->byId as $message) {
             // '' is system mail, as the real repository reads it.
             if (($message->getTenantId() ?? '') === ($tenantId ?? '') && $message->getIdempotencyKey() === $idempotencyKey) {
@@ -1051,6 +1165,19 @@ final class MailServiceMessages implements MailRepositoryInterface, MailRecovery
 
         return true;
     }
+}
+
+final class MailServiceLog implements \Semitexa\Core\Log\LoggerInterface
+{
+    /** @var list<string> */
+    public array $warnings = [];
+
+    public function error(string $message, array $context = []): void {}
+    public function critical(string $message, array $context = []): void {}
+    public function warning(string $message, array $context = []): void { $this->warnings[] = $message; }
+    public function info(string $message, array $context = []): void {}
+    public function notice(string $message, array $context = []): void {}
+    public function debug(string $message, array $context = []): void {}
 }
 
 final class MailServiceAttempts implements MailAttemptRepositoryInterface

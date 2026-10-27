@@ -198,17 +198,37 @@ class MailMessageRepository implements MailRepositoryInterface, MailRetentionInt
             return 0;
         }
 
-        $params = [];
-        foreach (array_values($ids) as $i => $id) {
-            $params["id{$i}"] = $id;
-        }
-        $in = ':' . implode(', :', array_keys($params));
-        $adapter->execute("DELETE FROM mail_attempts WHERE mail_message_id IN ({$in})", $params);
-
-        return $adapter->execute(
+        [$in, $params] = self::inList($ids);
+        // The mails first, then the attempts of those that went: a mail
+        // resent between the SELECT and here is kept by the guard below,
+        // and with the attempts deleted first it stayed without them — its
+        // history lost, its next attempt numbered 1 again.
+        $deleted = $adapter->execute(
             "DELETE FROM mail_messages WHERE id IN ({$in}) AND status IN ({$finished}) AND updated_at < :cutoff",
             $params + ['cutoff' => $cutoff->setTimezone(new \DateTimeZone('UTC'))->format('Y-m-d H:i:s')],
         )->rowCount;
+        $kept = array_column($adapter->execute("SELECT id FROM mail_messages WHERE id IN ({$in})", $params)->rows, 'id');
+        $gone = array_values(array_diff($ids, $kept));
+        if ($gone !== []) {
+            [$in, $params] = self::inList($gone);
+            $adapter->execute("DELETE FROM mail_attempts WHERE mail_message_id IN ({$in})", $params);
+        }
+
+        return $deleted;
+    }
+
+    /**
+     * @param non-empty-list<mixed> $values
+     * @return array{string, array<string, mixed>} the placeholders for IN (…) and their parameters
+     */
+    private static function inList(array $values): array
+    {
+        $params = [];
+        foreach ($values as $i => $value) {
+            $params["id{$i}"] = $value;
+        }
+
+        return [':' . implode(', :', array_keys($params)), $params];
     }
 
     private function orm(): OrmManager

@@ -158,6 +158,15 @@ final class MailService implements MailServiceInterface
             'idempotencyKey' => [$envelope->idempotencyKey, 255],
             'mailerKey' => [$envelope->mailerKey, 128],
         ]);
+        // A recipient's name goes into the row's JSON, whose encoding threw
+        // a JsonException out of send() on a name that is not UTF-8.
+        foreach (['to' => $envelope->to, 'cc' => $envelope->cc, 'bcc' => $envelope->bcc] as $field => $list) {
+            foreach ($list as $recipient) {
+                if ($unstorable === null && $recipient->name !== null && !mb_check_encoding($recipient->name, 'UTF-8')) {
+                    $unstorable = sprintf("The name of %s recipient %s is not valid UTF-8.", $field, $recipient->email);
+                }
+            }
+        }
         if ($unstorable !== null) {
             return new MailDispatchResult(
                 status:       MailDispatchStatus::Failed,
@@ -530,8 +539,9 @@ final class MailService implements MailServiceInterface
         }
 
         if ($result->status === MailTransportStatus::Accepted) {
-            if ($result->errorMessage !== null) {
-                StaticLoggerBridge::warning('mail', "Mail '{$messageId}': {$result->errorMessage}");
+            $warning = $result->warningForLog();
+            if ($warning !== null) {
+                StaticLoggerBridge::warning('mail', "Mail '{$messageId}': {$warning}");
             }
 
             return new MailDispatchResult(
