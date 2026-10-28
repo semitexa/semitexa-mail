@@ -120,7 +120,7 @@ final class MailServiceTest extends TestCase
         $result = $this->service()->send($envelope, $this->now());
 
         self::assertSame('https://example.test/reset?token=secret', $this->fake->getLastMessage()?->textBody, 'the recipient gets the link');
-        self::assertSame('<a href="https://example.test/reset?token=secret">Reset</a>', $this->fake->getLastMessage()?->htmlBody, 'in both bodies');
+        self::assertSame('<a href="https://example.test/reset?token=secret">Reset</a>', $this->fake->getLastMessage()->htmlBody, 'in both bodies');
         $row = $this->messages->byId($result->messageId);
         self::assertNotNull($row);
         self::assertSame('sent', $row->getStatus());
@@ -518,6 +518,9 @@ final class MailServiceTest extends TestCase
         $envelope->idempotencyKey = 'order-45-receipt';
 
         $first = $this->service(driver: 'scripted')->send($envelope, $this->now());
+        // Failed would be resent too (provider_4xx is not final): only a
+        // deferred row takes the process-local branch.
+        self::assertSame('deferred', $this->messages->byId($first->messageId)?->getStatus());
         $again = $this->service()->send(clone $envelope, $this->now());
 
         self::assertNotNull($first->messageId);
@@ -1147,7 +1150,7 @@ final class MailServiceMessages implements MailRepositoryInterface, MailRecovery
     public function claimForResend(MailMessage $message): bool
     {
         $row = $this->byId[$message->getId()] ?? null;
-        if ($row === null || $row->getStatus() !== $message->getStatus()) {
+        if ($row === null || $row->getStatus() !== $message->getStatus() || $row->getErrorCode() !== $message->getErrorCode()) {
             return false;
         }
         $this->byId[$row->getId()] = $row->with(['status' => 'pending', 'errorCode' => null, 'errorMessage' => null]);

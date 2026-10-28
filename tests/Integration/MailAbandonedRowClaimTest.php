@@ -96,6 +96,47 @@ final class MailAbandonedRowClaimTest extends TestCase
         self::assertFalse($repository->claimForSending($sent, $cutoff));
     }
 
+    /**
+     * Two keyed sends read the same failed row. The first took it, sent it
+     * and stored an outcome it may not repeat; the second, still holding its
+     * old read, matched on `failed` alone and sent the mail a second time.
+     */
+    #[Test]
+    public function a_resend_whose_read_predates_another_resends_outcome_takes_nothing(): void
+    {
+        $repository = new MailMessageRepository();
+        $row = $this->stored($repository, 'failed', null);
+        $repository->save($row->with(['errorCode' => 'provider_4xx', 'errorMessage' => '451 Try again later']));
+        $read = $repository->findById($row->getId());
+        self::assertNotNull($read);
+        $staleRead = clone $read;
+
+        self::assertTrue($repository->claimForResend($read));
+        self::assertTrue($repository->saveOutcomeUnlessSent($read->with([
+            'status' => 'failed', 'errorCode' => 'unknown_transport_error', 'errorMessage' => 'No reply after the message was sent',
+        ])));
+
+        self::assertFalse($repository->claimForResend($staleRead), 'the second resend saw provider_4xx, the row says unknown_transport_error');
+        $stored = $repository->findById($row->getId());
+        self::assertNotNull($stored);
+        self::assertSame('failed', $stored->getStatus());
+        self::assertSame('unknown_transport_error', $stored->getErrorCode());
+        self::assertSame('No reply after the message was sent', $stored->getErrorMessage());
+    }
+
+    /** A row with no error code is claimed as before: NULL is matched, not skipped. */
+    #[Test]
+    public function a_deferred_row_without_an_error_code_is_claimed_once(): void
+    {
+        $repository = new MailMessageRepository();
+        $row = $this->stored($repository, 'deferred', null);
+        self::assertNull($row->getErrorCode());
+
+        self::assertTrue($repository->claimForResend($row));
+        self::assertSame('pending', $repository->findById($row->getId())?->getStatus());
+        self::assertFalse($repository->claimForResend($row), 'taken once');
+    }
+
     private function stored(MailMessageRepository $repository, string $status, ?string $updatedAt): MailMessage
     {
         $row = $repository->save(new MailMessage(

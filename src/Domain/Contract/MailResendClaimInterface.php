@@ -15,8 +15,9 @@ interface MailResendClaimInterface
 {
     /**
      * Move $message back to `pending`, its error cleared, if it is still in
-     * the status it was read with. True for exactly one of two concurrent
-     * callers.
+     * the status and has the error code it was read with. True for exactly
+     * one of two concurrent callers, and false for a caller whose read
+     * predates another resend's outcome.
      */
     public function claimForResend(MailMessage $message): bool;
 }

@@ -130,13 +130,20 @@ class MailMessageRepository implements MailRepositoryInterface, MailRetentionInt
 
     public function claimForResend(MailMessage $message): bool
     {
+        // The error code too, not the status alone: it is what the resend
+        // decided on. A caller that read the row before another resend took
+        // it still saw `failed` after that resend stored `failed` again, with
+        // an outcome it may not repeat (no reply after the message went out),
+        // and sent the mail a second time.
         return $this->orm()->getQueryAdapter()->execute(
-            'UPDATE mail_messages SET status = :pending, error_code = NULL, error_message = NULL, updated_at = :now WHERE id = :id AND status = :seen',
+            "UPDATE mail_messages SET status = :pending, error_code = NULL, error_message = NULL, updated_at = :now
+             WHERE id = :id AND status = :seen AND COALESCE(error_code, '') = :seen_error",
             [
                 'pending' => MailMessageStatus::Pending->value,
                 'now' => (new \DateTimeImmutable('now', new \DateTimeZone('UTC')))->format('Y-m-d H:i:s'),
                 'id' => Uuid7::toBytes($message->getId()),
                 'seen' => $message->getStatus(),
+                'seen_error' => $message->getErrorCode() ?? '',
             ],
         )->rowCount === 1;
     }
