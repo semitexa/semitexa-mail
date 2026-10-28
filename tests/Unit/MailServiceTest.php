@@ -114,15 +114,18 @@ final class MailServiceTest extends TestCase
     public function a_sensitive_mail_is_sent_whole_and_its_stored_bodies_are_erased(): void
     {
         $envelope = $this->envelope(subject: 'Reset', text: 'https://example.test/reset?token=secret');
+        $envelope->htmlBody = '<a href="https://example.test/reset?token=secret">Reset</a>';
         $envelope->sensitive = true;
 
         $result = $this->service()->send($envelope, $this->now());
 
         self::assertSame('https://example.test/reset?token=secret', $this->fake->getLastMessage()?->textBody, 'the recipient gets the link');
+        self::assertSame('<a href="https://example.test/reset?token=secret">Reset</a>', $this->fake->getLastMessage()?->htmlBody, 'in both bodies');
         $row = $this->messages->byId($result->messageId);
         self::assertNotNull($row);
         self::assertSame('sent', $row->getStatus());
         self::assertSame(\Semitexa\Mail\Domain\Model\SensitiveMailBodies::ERASED, $row->getTextBody());
+        self::assertSame(\Semitexa\Mail\Domain\Model\SensitiveMailBodies::ERASED, $row->getHtmlBody());
         self::assertSame('Reset', $row->getSubject(), 'only the bodies go');
 
         $plain = $this->service()->send($this->envelope(subject: 'Hi', text: 'Hello'), $this->now());
@@ -312,7 +315,9 @@ final class MailServiceTest extends TestCase
 
         $envelope = $this->envelope();
         $envelope->subject = str_repeat('é', 998);
-        self::assertNotSame(MailDispatchStatus::Failed, $this->service()->send($envelope, $this->now())->status, 'exactly 998 characters fit');
+        self::assertSame(MailDispatchStatus::Sent, $this->service()->send($envelope, $this->now())->status, 'exactly 998 characters fit');
+        self::assertSame(1, $this->fake->count());
+        self::assertSame(str_repeat('é', 998), $this->fake->getLastMessage()?->subject);
     }
 
     /** The same for every column with a length, and for a value that is not UTF-8. */
@@ -469,7 +474,9 @@ final class MailServiceTest extends TestCase
         $first = $this->service(driver: 'scripted')->send($envelope, $this->now());
         self::assertSame(MailDispatchStatus::Queued, $first->status, 'a retry is queued');
         self::assertCount(1, MailServiceQueueSpy::$published);
-        self::assertStringContainsString('"attempts":1', MailServiceQueueSpy::$published[0][1]);
+        $retry = json_decode(MailServiceQueueSpy::$published[0][1], true, 512, JSON_THROW_ON_ERROR);
+        self::assertSame(1, $retry['attempts']);
+        self::assertSame($first->messageId, $retry['messageId']);
 
         $again = $this->service()->send(clone $envelope, $this->now());
 
@@ -510,11 +517,14 @@ final class MailServiceTest extends TestCase
         $envelope = $this->envelope(subject: 'Receipt', text: 'Paid');
         $envelope->idempotencyKey = 'order-45-receipt';
 
-        $this->service(driver: 'scripted')->send($envelope, $this->now());
+        $first = $this->service(driver: 'scripted')->send($envelope, $this->now());
         $again = $this->service()->send(clone $envelope, $this->now());
 
+        self::assertNotNull($first->messageId);
+        self::assertSame($first->messageId, $again->messageId, 'the deferred row is sent, not a new one');
         self::assertSame(MailDispatchStatus::Sent, $again->status);
         self::assertSame(1, $this->fake->count());
+        self::assertSame(1, $this->messages->count());
     }
 
     #[Test]
