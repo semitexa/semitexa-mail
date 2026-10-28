@@ -9,13 +9,20 @@ use Semitexa\Core\Attribute\SatisfiesRepositoryContract;
 use Semitexa\Mail\Application\Db\MySQL\Model\MailMessageResource;
 use Semitexa\Mail\Domain\Model\MailMessage;
 use Semitexa\Mail\Domain\Contract\MailRepositoryInterface;
+use Semitexa\Mail\Domain\Contract\MailRecoveryInterface;
+use Semitexa\Mail\Domain\Contract\MailSendingClaimInterface;
+use Semitexa\Mail\Domain\Contract\MailOutcomeGuardInterface;
+use Semitexa\Mail\Domain\Contract\MailResendClaimInterface;
+use Semitexa\Mail\Domain\Enum\MailMessageStatus;
+use Semitexa\Mail\Domain\Contract\MailRetentionInterface;
+use Semitexa\Orm\Application\Service\Uuid7;
 use Semitexa\Orm\OrmManager;
 use Semitexa\Orm\Query\Operator;
 use Semitexa\Orm\Query\SystemScopeToken;
 use Semitexa\Orm\Repository\DomainRepository;
 
 #[SatisfiesRepositoryContract(of: MailRepositoryInterface::class)]
-class MailMessageRepository implements MailRepositoryInterface
+class MailMessageRepository implements MailRepositoryInterface, MailRetentionInterface, MailRecoveryInterface, MailSendingClaimInterface, MailOutcomeGuardInterface, MailResendClaimInterface
 {
     #[InjectAsReadonly]
     protected OrmManager $orm;
@@ -34,12 +41,27 @@ class MailMessageRepository implements MailRepositoryInterface
         return $this->system()->findById($id);
     }
 
-    public function findByIdempotencyKey(string $tenantId, string $idempotencyKey): ?MailMessage
+    public function findByIdempotencyKey(?string $tenantId, string $idempotencyKey): ?MailMessage
     {
+        if ($tenantId !== null && $tenantId !== '') {
+            /** @var MailMessage|null */
+            return $this->repository()->forTenant($tenantId)->query()
+                ->where(MailMessageResource::column('idempotency_key'), Operator::Equals, $idempotencyKey)
+                ->fetchOneAs(MailMessage::class, $this->orm()->getMapperRegistry());
+        }
+
+        // System mail (no tenant) is stored with tenant '' (the mapper), which
+        // the unique index holds to one row per key; a row from before that
+        // has NULL, and is found too.
         /** @var MailMessage|null */
-        return $this->repository()->forTenant($tenantId)->query()
+        return $this->system()->query()
+            ->where(MailMessageResource::column('tenant_id'), Operator::Equals, '')
             ->where(MailMessageResource::column('idempotency_key'), Operator::Equals, $idempotencyKey)
-            ->fetchOneAs(MailMessage::class, $this->orm()->getMapperRegistry());
+            ->fetchOneAs(MailMessage::class, $this->orm()->getMapperRegistry())
+            ?? $this->system()->query()
+                ->whereNull(MailMessageResource::column('tenant_id'))
+                ->where(MailMessageResource::column('idempotency_key'), Operator::Equals, $idempotencyKey)
+                ->fetchOneAs(MailMessage::class, $this->orm()->getMapperRegistry());
     }
 
     public function save(MailMessage $entity): MailMessage
@@ -73,6 +95,147 @@ class MailMessageRepository implements MailRepositoryInterface
             MailMessageResource::class,
             MailMessage::class,
         );
+    }
+
+    public function saveOutcomeUnlessSent(MailMessage $entity): bool
+    {
+        $utc = new \DateTimeZone('UTC');
+        $id = Uuid7::toBytes($entity->getId());
+        $changed = $this->orm()->getQueryAdapter()->execute(
+            "UPDATE mail_messages
+             SET status = :status, error_code = :error_code, error_message = :error_message,
+                 provider_message_id = :provider_message_id,
+                 last_attempt_at = COALESCE(:last_attempt_at, last_attempt_at), updated_at = :updated_at
+             WHERE id = :id AND status <> 'sent'",
+            [
+                'status' => $entity->getStatus(),
+                'error_code' => $entity->getErrorCode(),
+                'error_message' => $entity->getErrorMessage(),
+                'provider_message_id' => $entity->getProviderMessageId(),
+                'last_attempt_at' => $entity->getLastAttemptAt()?->setTimezone($utc)->format('Y-m-d H:i:s'),
+                'updated_at' => (new \DateTimeImmutable('now', $utc))->format('Y-m-d H:i:s'),
+                'id' => $id,
+            ],
+        )->rowCount;
+        if ($changed > 0) {
+            return true;
+        }
+
+        // MySQL counts changed rows: 0 is also "the same values written
+        // again". Only a row that is sent was refused.
+        $row = $this->orm()->getQueryAdapter()->execute('SELECT status FROM mail_messages WHERE id = :id', ['id' => $id])->rows[0] ?? null;
+
+        return $row !== null && $row['status'] !== 'sent';
+    }
+
+    public function claimForResend(MailMessage $message): bool
+    {
+        // The error code too, not the status alone: it is what the resend
+        // decided on. A caller that read the row before another resend took
+        // it still saw `failed` after that resend stored `failed` again, with
+        // an outcome it may not repeat (no reply after the message went out),
+        // and sent the mail a second time.
+        return $this->orm()->getQueryAdapter()->execute(
+            "UPDATE mail_messages SET status = :pending, error_code = NULL, error_message = NULL, updated_at = :now
+             WHERE id = :id AND status = :seen AND COALESCE(error_code, '') = :seen_error",
+            [
+                'pending' => MailMessageStatus::Pending->value,
+                'now' => (new \DateTimeImmutable('now', new \DateTimeZone('UTC')))->format('Y-m-d H:i:s'),
+                'id' => Uuid7::toBytes($message->getId()),
+                'seen' => $message->getStatus(),
+                'seen_error' => $message->getErrorCode() ?? '',
+            ],
+        )->rowCount === 1;
+    }
+
+    public function claimAbandoned(MailMessage $message, \DateTimeImmutable $staleBefore): bool
+    {
+        $utc = new \DateTimeZone('UTC');
+
+        return $this->orm()->getQueryAdapter()->execute(
+            "UPDATE mail_messages SET status = 'pending', updated_at = :now
+             WHERE id = :id AND status IN ('pending', 'sending') AND updated_at < :stale",
+            [
+                'now' => (new \DateTimeImmutable('now', $utc))->format('Y-m-d H:i:s'),
+                'id' => Uuid7::toBytes($message->getId()),
+                'stale' => $staleBefore->setTimezone($utc)->format('Y-m-d H:i:s'),
+            ],
+        )->rowCount === 1;
+    }
+
+    public function claimForSending(MailMessage $message, \DateTimeImmutable $staleBefore): bool
+    {
+        $utc = new \DateTimeZone('UTC');
+        $now = (new \DateTimeImmutable('now', $utc))->format('Y-m-d H:i:s');
+
+        return $this->orm()->getQueryAdapter()->execute(
+            "UPDATE mail_messages SET status = 'sending', last_attempt_at = :now_attempt, updated_at = :now
+             WHERE id = :id AND status <> 'sent' AND (status <> 'sending' OR updated_at < :stale)",
+            [
+                'now_attempt' => $now,
+                'now' => $now,
+                'stale' => $staleBefore->setTimezone($utc)->format('Y-m-d H:i:s'),
+                'id' => Uuid7::toBytes($message->getId()),
+            ],
+        )->rowCount === 1;
+    }
+
+    public function takeForDelivery(MailMessage $message): bool
+    {
+        return $this->orm()->getQueryAdapter()->execute(
+            "UPDATE mail_messages SET status = 'sending', updated_at = :now WHERE id = :id AND status = 'pending'",
+            [
+                'now' => (new \DateTimeImmutable('now', new \DateTimeZone('UTC')))->format('Y-m-d H:i:s'),
+                'id' => Uuid7::toBytes($message->getId()),
+            ],
+        )->rowCount === 1;
+    }
+
+    public function deleteFinishedBefore(\DateTimeImmutable $cutoff, int $limit): int
+    {
+        $adapter = $this->orm()->getQueryAdapter();
+        $finished = "'sent', 'failed'";
+        // Through idx_mail_messages_status_updated: without it, every sweep
+        // read every finished row in the retained window.
+        $ids = array_column($adapter->execute(
+            "SELECT id FROM mail_messages WHERE status IN ({$finished}) AND updated_at < :cutoff LIMIT " . max(1, min($limit, 500)),
+            ['cutoff' => $cutoff->setTimezone(new \DateTimeZone('UTC'))->format('Y-m-d H:i:s')],
+        )->rows, 'id');
+        if ($ids === []) {
+            return 0;
+        }
+
+        [$in, $params] = self::inList($ids);
+        // The mails first, then the attempts of those that went: a mail
+        // resent between the SELECT and here is kept by the guard below,
+        // and with the attempts deleted first it stayed without them — its
+        // history lost, its next attempt numbered 1 again.
+        $deleted = $adapter->execute(
+            "DELETE FROM mail_messages WHERE id IN ({$in}) AND status IN ({$finished}) AND updated_at < :cutoff",
+            $params + ['cutoff' => $cutoff->setTimezone(new \DateTimeZone('UTC'))->format('Y-m-d H:i:s')],
+        )->rowCount;
+        $kept = array_column($adapter->execute("SELECT id FROM mail_messages WHERE id IN ({$in})", $params)->rows, 'id');
+        $gone = array_values(array_diff($ids, $kept));
+        if ($gone !== []) {
+            [$in, $params] = self::inList($gone);
+            $adapter->execute("DELETE FROM mail_attempts WHERE mail_message_id IN ({$in})", $params);
+        }
+
+        return $deleted;
+    }
+
+    /**
+     * @param non-empty-list<mixed> $values
+     * @return array{string, array<string, mixed>} the placeholders for IN (…) and their parameters
+     */
+    private static function inList(array $values): array
+    {
+        $params = [];
+        foreach ($values as $i => $value) {
+            $params["id{$i}"] = $value;
+        }
+
+        return [':' . implode(', :', array_keys($params)), $params];
     }
 
     private function orm(): OrmManager

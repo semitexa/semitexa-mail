@@ -26,7 +26,8 @@ final class MailMessageMapper implements ResourceModelMapperInterface
 
         return new MailMessage(
             id: $resourceModel->id,
-            tenantId: $resourceModel->tenant_id,
+            // '' on the row is system mail, no tenant (see toResourceModel).
+            tenantId: $resourceModel->tenant_id === '' ? null : $resourceModel->tenant_id,
             status: $resourceModel->status,
             driver: $resourceModel->driver,
             fromEmail: $resourceModel->from_email,
@@ -50,6 +51,8 @@ final class MailMessageMapper implements ResourceModelMapperInterface
             lastAttemptAt: $resourceModel->last_attempt_at,
             createdAt: $resourceModel->created_at,
             updatedAt: $resourceModel->updated_at,
+            mailerKey: $resourceModel->mailer_key,
+            replyToName: $resourceModel->reply_to_name,
         );
     }
 
@@ -63,7 +66,10 @@ final class MailMessageMapper implements ResourceModelMapperInterface
 
         return new MailMessageResource(
             id: $domainModel->getId(),
-            tenant_id: $domainModel->getTenantId(),
+            // System mail as '', not NULL: the unique (tenant_id, idempotency_key)
+            // index lets any number of NULLs through, and two concurrent sends
+            // of one key without a tenant were both stored and both delivered.
+            tenant_id: $domainModel->getTenantId() ?? '',
             status: $domainModel->getStatus(),
             driver: $domainModel->getDriver(),
             template_handle: $domainModel->getTemplateHandle(),
@@ -88,6 +94,8 @@ final class MailMessageMapper implements ResourceModelMapperInterface
             last_attempt_at: $domainModel->getLastAttemptAt(),
             created_at: $domainModel->getCreatedAt(),
             updated_at: $domainModel->getUpdatedAt(),
+            mailer_key: $domainModel->getMailerKey(),
+            reply_to_name: $domainModel->getReplyToName(),
         );
     }
 

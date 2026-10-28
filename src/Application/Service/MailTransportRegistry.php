@@ -20,8 +20,11 @@ final class MailTransportRegistry
             return;
         }
 
-        self::register(new SmtpMailTransport());
-        self::register(new NullMailTransport());
+        // Only where nothing is registered yet: boot() runs on the first get(),
+        // and it overwrote an `smtp` or `null` transport registered before it.
+        foreach ([new SmtpMailTransport(), new NullMailTransport()] as $transport) {
+            self::$transports[$transport->key()] ??= $transport;
+        }
 
         self::$booted = true;
     }

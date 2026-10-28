@@ -10,6 +10,7 @@ interface MailRepositoryInterface
 {
     public function findById(int|string $id): ?MailMessage;
 
+    /** $tenantId '' for system mail (no tenant). */
     public function findByIdempotencyKey(string $tenantId, string $idempotencyKey): ?MailMessage;
 
     /**

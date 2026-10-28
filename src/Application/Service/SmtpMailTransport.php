@@ -4,6 +4,8 @@ declare(strict_types=1);
 
 namespace Semitexa\Mail\Application\Service;
 
+use Semitexa\Core\Environment;
+use Semitexa\Mail\Exception\MailTlsException;
 use Semitexa\Mail\Exception\SmtpException;
 
 use Semitexa\Mail\Domain\Contract\MailTransportInterface;
@@ -13,10 +15,23 @@ use Semitexa\Mail\Domain\Enum\MailErrorCode;
 use Semitexa\Mail\Domain\Model\MailTransportResult;
 use Semitexa\Mail\Domain\Enum\MailTransportStatus;
 use Semitexa\Mail\Domain\Model\PreparedMailMessage;
+use Semitexa\Mail\Domain\Model\MailRecipient;
 
 final class SmtpMailTransport implements MailTransportInterface
 {
     private readonly MimeBuilder $mimeBuilder;
+
+    /**
+     * The wait for the reply to the final dot. RFC 5321 gives ten minutes;
+     * a queue's message comes back to another worker after its ack wait
+     * (NATS: 300 s), which would send the mail a second time, so less.
+     */
+    private const FINAL_REPLY_SECONDS = 240;
+
+    /** A MySQL TEXT column (error_message) holds 65 535 bytes. */
+    public const int MAX_ERROR_MESSAGE = 65535;
+
+    private const string TRUNCATED = ' … (truncated)';
 
     public function __construct()
     {
@@ -32,54 +47,203 @@ final class SmtpMailTransport implements MailTransportInterface
     {
         $socket = null;
         try {
-            $socket = $this->connect($config);
+            // Both before the connection: a bad MAIL_ENCRYPTION or a message
+            // the builder refuses touched the network first, and could be
+            // reported as a network error and retried.
+            $encryption = MailerConfig::normalizeEncryption($config->encryption);
+            if ($encryption !== null && !in_array($encryption, ['tls', 'ssl'], true)) {
+                throw new MailTlsException("MAIL_ENCRYPTION '{$config->encryption}' is not tls or ssl: nothing is sent in plain text instead.");
+            }
+            // A non-ASCII domain went out raw, in RCPT TO and the headers: it
+            // goes as its ASCII (punycode) form when ext-intl is there.
+            // The refusals name the address as stored, not its punycode.
+            $original = $message;
+            $message = self::withAsciiDomains($message);
+            $mime = $this->mimeBuilder->build($message);
+
+            $socket = $this->connect($config, $encryption);
             $this->readResponse($socket, 220);
 
-            $this->sendEhlo($socket, $config);
+            $ehlo = $this->sendEhlo($socket);
 
-            if ($config->encryption === 'tls') {
-                $this->sendCommand($socket, 'STARTTLS', 220);
-                stream_socket_enable_crypto($socket, true, STREAM_CRYPTO_METHOD_TLSv1_2_CLIENT | STREAM_CRYPTO_METHOD_TLSv1_3_CLIENT);
-                $this->sendEhlo($socket, $config);
+            if ($encryption === 'tls') {
+                try {
+                    $this->sendCommand($socket, 'STARTTLS', 220);
+                } catch (SmtpException $e) {
+                    // A server that does not offer STARTTLS (502) answered
+                    // provider_5xx, which again() takes for a mail refused for
+                    // good: after MAIL_ENCRYPTION was fixed, it was never sent.
+                    // A setup problem; a temporary 454 stays deferred.
+                    if ($e->smtpCode >= 500) {
+                        throw new MailTlsException("{$config->host} refused STARTTLS ({$e->smtpCode} " . trim((string) $e->smtpResponse) . "): it does not offer it on this port, or cannot start TLS. Use MAIL_ENCRYPTION=ssl (port 465) or the server's STARTTLS port.", 0, $e);
+                    }
+                    throw $e;
+                }
+                // A failed handshake left the connection in plain text, and
+                // AUTH went out over it.
+                if (@stream_socket_enable_crypto($socket, true, STREAM_CRYPTO_METHOD_TLSv1_2_CLIENT | STREAM_CRYPTO_METHOD_TLSv1_3_CLIENT) !== true) {
+                    throw new MailTlsException("STARTTLS with {$config->host} failed: " . (error_get_last()['message'] ?? 'certificate not trusted, or no common TLS version'));
+                }
+                $ehlo = $this->sendEhlo($socket);
+            }
+
+            // What is still not ASCII (a local part, or a domain without
+            // ext-intl) needs SMTPUTF8 (RFC 6531); a server without it got
+            // raw 8-bit bytes in MAIL FROM, RCPT TO and the headers.
+            $international = self::nonAsciiAddresses($message);
+            $smtpUtf8 = $international !== [] && preg_match('/^250[ -]SMTPUTF8\b/mi', $ehlo) === 1;
+            // config_error, not invalid_recipient: again() refuses to resend
+            // that, and the fix (ext-intl, another MAIL_HOST) is a setup one.
+            if ($international !== [] && !$smtpUtf8) {
+                $domainOnly = array_filter($international, static fn (string $a): bool => preg_match('/[^\x00-\x7F]/', substr($a, 0, (int) strrpos($a, '@'))) !== 1);
+                return new MailTransportResult(
+                    status: MailTransportStatus::Failed,
+                    errorCode: MailErrorCode::ConfigError->value,
+                    errorMessage: 'Not sent: ' . implode(', ', $international) . " needs SMTPUTF8, which {$config->host} does not offer"
+                        . ($domainOnly !== [] && !function_exists('idn_to_ascii') ? ' (with the PHP intl extension a non-ASCII domain is sent as punycode).' : '.'),
+                );
             }
 
             if ($config->username !== null && $config->password !== null) {
-                $this->authenticate($socket, $config->username, $config->password);
+                // The password went to any host in plain text when
+                // MAIL_ENCRYPTION was empty, its default. A local relay (this
+                // machine, a compose service) is let through; anything else
+                // needs TLS or MAIL_ALLOW_PLAINTEXT_AUTH=1.
+                if ($encryption === null && !self::isLocalRelay($config->host, (string) stream_socket_get_name($socket, true)) && !self::plaintextAuthAllowed()) {
+                    throw new MailTlsException("Not signing in to {$config->host} without TLS: the password would cross the network in plain text. Set MAIL_ENCRYPTION=tls (or ssl), or MAIL_ALLOW_PLAINTEXT_AUTH=1 for a trusted network.");
+                }
+                $this->authenticate($socket, $config->username, $config->password, $ehlo);
             }
 
-            $this->sendCommand($socket, "MAIL FROM:<{$message->from->email}>", 250);
+            $this->sendCommand($socket, "MAIL FROM:<{$message->from->email}>" . ($smtpUtf8 ? ' SMTPUTF8' : ''), 250);
 
             $allRecipients = [...$message->to, ...$message->cc, ...$message->bcc];
-            foreach ($allRecipients as $recipient) {
-                $this->sendCommand($socket, "RCPT TO:<{$recipient->email}>", 250);
+            $storedRecipients = [...$original->to, ...$original->cc, ...$original->bcc];
+            // One address the server refuses for good (a mistyped cc) failed
+            // the mail for everyone: it goes to the others, and the refused
+            // ones are reported. A temporary refusal still defers the whole
+            // mail: sent now, its retry would reach the others twice.
+            $refused = [];
+            $lastRefusal = null;
+            foreach ($allRecipients as $i => $recipient) {
+                try {
+                    $this->sendCommand($socket, "RCPT TO:<{$recipient->email}>", 250);
+                } catch (SmtpException $e) {
+                    // 251, "will forward", is an accepted recipient too.
+                    if ($e->smtpCode === 251) {
+                        continue;
+                    }
+                    // "Too many recipients" (5.5.3; RFC 5321 §4.5.3.1.10 asks 452,
+                    // servers also answer 550/552/554): skipped, the rest of a long
+                    // list was dropped and the mail counted as sent; deferred, every
+                    // retry hits the same limit. It fails the mail at once, as
+                    // invalid_recipient. Another 552 (a full mailbox, 5.2.2)
+                    // refuses that one recipient.
+                    if ($e->smtpCode >= 400 && $e->smtpCode < 600 && preg_match('/^\d{3}[ -][45]\.5\.3\b|too many recipients/im', $e->smtpResponse) === 1) {
+                        throw new SmtpException($e->getMessage() . ' (too many recipients for this server: split the list)', 552, $e->smtpResponse, $e);
+                    }
+                    // Only a 5xx is a refusal for good; anything else (a 4xx,
+                    // no reply, a reply out of step) stops the whole mail.
+                    if ($e->smtpCode < 500 || $e->smtpCode >= 600) {
+                        throw $e;
+                    }
+                    // One line: a multi-line reply split the row's message and the log line.
+                    // ASCII only: a legacy server's 8-bit reply made strict MySQL refuse
+                    // the save of the sent row, left sending, and sent again.
+                    $refused[] = ['email' => $storedRecipients[$i]->email, 'smtp_code' => $e->smtpCode, 'smtp_response' => trim((string) preg_replace(['/\s*\r?\n\s*/', '/[^\x20-\x7E]/'], [' ', '?'], $e->smtpResponse))];
+                    $lastRefusal = $e;
+                }
+            }
+            if ($lastRefusal !== null && count($refused) === count($allRecipients)) {
+                throw $lastRefusal;
             }
 
             $this->sendCommand($socket, 'DATA', 354);
 
-            $mime = $this->mimeBuilder->build($message);
             $data = $mime['headers'] . "\r\n" . $mime['body'];
 
             // Dot-stuffing
             $data = str_replace("\r\n.", "\r\n..", $data);
 
-            fwrite($socket, $data . "\r\n.\r\n");
-            $dataResponse = $this->readResponse($socket, 250);
+            $payload = $data . "\r\n.\r\n";
+            // Cut short, the server never got the final dot: not delivered,
+            // and retried as a network error, not taken for a mail that may be.
+            if (@fwrite($socket, $payload) !== strlen($payload)) {
+                throw new SmtpException('Connection lost while sending the message', 0, '');
+            }
+            // The reply to the final dot can be slow (a content filter): cut
+            // off at MAIL_TIMEOUT, a mail the server then accepted was sent
+            // again. Without any reply the
+            // outcome is unknown, and it is not sent again on its own.
+            stream_set_timeout($socket, max($config->timeoutSeconds, self::FINAL_REPLY_SECONDS));
+            try {
+                $dataResponse = $this->readResponse($socket, 250);
+            } catch (SmtpException $e) {
+                if ($e->smtpCode !== 0) {
+                    throw $e;
+                }
 
-            $this->sendCommand($socket, 'QUIT', 221);
+                return new MailTransportResult(
+                    status: MailTransportStatus::Failed,
+                    errorCode: MailErrorCode::UnknownTransportError->value,
+                    errorMessage: "No reply after the message was sent to {$config->host}: it may have been delivered, so it is not sent again. Check the recipient before resending.",
+                );
+            }
+
+            // The server has accepted the message: a failing QUIT or a dropped
+            // connection now is not a failed delivery. Counted as one, the
+            // worker sent it again and the recipient got it twice.
+            try {
+                $this->sendCommand($socket, 'QUIT', 221);
+            } catch (\Throwable) {
+            }
+
+            $notDelivered = $refused === [] ? null : 'Not delivered to: ' . implode('; ', array_map(
+                // The reply starts with its code.
+                static fn (array $r): string => "{$r['email']} ({$r['smtp_response']})",
+                $refused,
+            ));
+            // error_message is a TEXT column: a few hundred refused addresses
+            // went past it, the save of the sent row failed, the row stayed
+            // `sending` and a resend delivered the mail again. Cut between
+            // characters (a stored address may be UTF-8); every address is
+            // still in providerResponse.
+            if ($notDelivered !== null && strlen($notDelivered) > self::MAX_ERROR_MESSAGE) {
+                $notDelivered = mb_strcut($notDelivered, 0, self::MAX_ERROR_MESSAGE - strlen(self::TRUNCATED), 'UTF-8') . self::TRUNCATED;
+            }
 
             return new MailTransportResult(
                 status: MailTransportStatus::Accepted,
                 providerMessageId: $message->messageId,
-                providerStatus: 'sent',
-                providerResponse: ['smtp_response' => $dataResponse],
+                // Said on the message row, which still reads sent: a refused
+                // cc showed nowhere anyone looks.
+                errorMessage: $notDelivered,
+                providerStatus: $refused === [] ? 'sent' : 'sent_partially',
+                providerResponse: ['smtp_response' => $dataResponse] + ($refused === [] ? [] : ['refused_recipients' => $refused]),
             );
         } catch (SmtpException $e) {
             $errorCode = $this->classifySmtpError($e);
             return new MailTransportResult(
-                status: $errorCode->isRetryable() ? MailTransportStatus::Deferred : MailTransportStatus::Failed,
+                status: self::isTemporary($e->smtpCode) ? MailTransportStatus::Deferred : MailTransportStatus::Failed,
                 errorCode: $errorCode->value,
                 errorMessage: $e->getMessage(),
                 providerResponse: ['smtp_code' => $e->smtpCode, 'smtp_response' => $e->smtpResponse],
+            );
+        } catch (\InvalidArgumentException $e) {
+            // A malformed message (a custom header name the MIME builder
+            // refuses): sending it again builds the same message.
+            return new MailTransportResult(
+                status: MailTransportStatus::Failed,
+                errorCode: MailErrorCode::ConfigError->value,
+                errorMessage: $e->getMessage(),
+            );
+        } catch (MailTlsException $e) {
+            // Not network_error: the worker retries that, and a certificate
+            // problem was retried four times, a minute apart.
+            return new MailTransportResult(
+                status: MailTransportStatus::Failed,
+                errorCode: MailErrorCode::ConfigError->value,
+                errorMessage: $e->getMessage(),
             );
         } catch (\Throwable $e) {
             return new MailTransportResult(
@@ -97,15 +261,19 @@ final class SmtpMailTransport implements MailTransportInterface
     /**
      * @return resource
      */
-    private function connect(MailerConfig $config)
+    private function connect(MailerConfig $config, ?string $encryption)
     {
-        $protocol = $config->encryption === 'ssl' ? 'ssl' : 'tcp';
+        $protocol = $encryption === 'ssl' ? 'ssl' : 'tcp';
         $address = "{$protocol}://{$config->host}:{$config->port}";
 
+        // Certificates are checked: with checking off, anyone on the path
+        // could read the mail and the AUTH password. MAIL_VERIFY_PEER=false
+        // is for a local test server with a self-signed certificate.
         $context = stream_context_create(['ssl' => [
-            'verify_peer' => false,
-            'verify_peer_name' => false,
-            'allow_self_signed' => true,
+            'verify_peer' => $config->verifyPeer,
+            'verify_peer_name' => $config->verifyPeer,
+            'allow_self_signed' => !$config->verifyPeer,
+            'peer_name' => $config->host,
         ]]);
 
         $socket = @stream_socket_client(
@@ -118,7 +286,13 @@ final class SmtpMailTransport implements MailTransportInterface
         );
 
         if ($socket === false) {
-            throw new SmtpException("Connection failed: {$errstr} ({$errno})", 0, '');
+            // With ssl:// a certificate failure reports errno 0 and an empty
+            // errstr; the reason is only in the last PHP warning.
+            $reason = trim($errstr) !== '' ? $errstr : (string) (error_get_last()['message'] ?? '');
+            if ($encryption === 'ssl' && preg_match('/ssl|certificate|tls/i', $reason) === 1) {
+                throw new MailTlsException("TLS with {$config->host} failed: {$reason}");
+            }
+            throw new SmtpException("Connection failed: {$reason} ({$errno})", 0, '');
         }
 
         stream_set_timeout($socket, $config->timeoutSeconds);
@@ -128,21 +302,42 @@ final class SmtpMailTransport implements MailTransportInterface
 
     /**
      * @param resource $socket
+     * @return string the EHLO reply (its AUTH lines name the mechanisms), '' after HELO
      */
-    private function sendEhlo($socket, MailerConfig $config): void
+    private function sendEhlo($socket): string
     {
+        $name = self::clientName($socket);
         try {
-            $this->sendCommand($socket, "EHLO {$config->host}", 250);
+            return $this->sendCommand($socket, "EHLO {$name}", 250);
         } catch (SmtpException) {
-            $this->sendCommand($socket, "HELO {$config->host}", 250);
+            $this->sendCommand($socket, "HELO {$name}", 250);
+
+            return '';
         }
     }
 
     /**
      * @param resource $socket
      */
-    private function authenticate($socket, string $username, string $password): void
+    private function authenticate($socket, string $username, string $password, string $ehloReply): void
     {
+        // LOGIN as before, PLAIN when the server offers only that (LOGIN was
+        // the one mechanism, and such servers refused every send).
+        if (self::authMechanism($ehloReply) === 'PLAIN') {
+            $credentials = base64_encode("\0{$username}\0{$password}");
+            fwrite($socket, "AUTH PLAIN {$credentials}\r\n");
+            try {
+                $this->readResponse($socket, 235);
+            } catch (SmtpException $e) {
+                // A server that wants the credentials as a continuation (334).
+                if ($e->smtpCode !== 334) {
+                    throw $e;
+                }
+                $this->sendCommand($socket, $credentials, 235);
+            }
+
+            return;
+        }
         $this->sendCommand($socket, 'AUTH LOGIN', 334);
         $this->sendCommand($socket, base64_encode($username), 334);
         $this->sendCommand($socket, base64_encode($password), 235);
@@ -181,6 +376,121 @@ final class SmtpMailTransport implements MailTransportInterface
         }
 
         return $response;
+    }
+
+    /**
+     * In SMTP a 4xx reply is temporary (greylisting answers 450/451) and a 5xx
+     * one permanent; 0 is a lost connection. The shared error codes say the
+     * opposite for HTTP providers, which is how greylisted mail failed for
+     * good and a 554 rejection was retried.
+     */
+    /**
+     * The name EHLO announces: this client's (it sent the server's own name,
+     * MAIL_HOST). A host name that is not a full domain (a container's hex id)
+     * is refused by strict servers, so it is then the address literal of the
+     * local end of the connection.
+     *
+     * @param resource $socket
+     */
+    private static function clientName($socket): string
+    {
+        $name = gethostname();
+        if (is_string($name) && self::isDomain($name)) {
+            return $name;
+        }
+        $local = stream_socket_get_name($socket, false);
+        $ip = is_string($local) ? preg_replace('/:\d+$/', '', $local) : null;
+        if (is_string($ip) && filter_var(trim($ip, '[]'), FILTER_VALIDATE_IP, FILTER_FLAG_IPV6) !== false) {
+            return '[IPv6:' . trim($ip, '[]') . ']';
+        }
+
+        return is_string($ip) && filter_var($ip, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4) !== false ? "[{$ip}]" : '[127.0.0.1]';
+    }
+
+    /** The message with every non-ASCII domain in its ASCII form, when ext-intl can make one. */
+    private static function withAsciiDomains(PreparedMailMessage $message): PreparedMailMessage
+    {
+        if (!function_exists('idn_to_ascii') || self::nonAsciiAddresses($message) === []) {
+            return $message;
+        }
+        $ascii = static function (MailRecipient $r): MailRecipient {
+            $at = strrpos($r->email, '@');
+            if ($at === false || preg_match('/[^\x00-\x7F]/', substr($r->email, $at + 1)) !== 1) {
+                return $r;
+            }
+            $domain = idn_to_ascii(substr($r->email, $at + 1), IDNA_NONTRANSITIONAL_TO_ASCII, INTL_IDNA_VARIANT_UTS46);
+
+            return $domain === false ? $r : new MailRecipient(substr($r->email, 0, $at + 1) . $domain, $r->name);
+        };
+        $copy = clone $message;
+        $copy->from = $ascii($message->from);
+        $copy->replyTo = $message->replyTo === null ? null : $ascii($message->replyTo);
+        $copy->to = array_map($ascii, $message->to);
+        $copy->cc = array_map($ascii, $message->cc);
+        $copy->bcc = array_map($ascii, $message->bcc);
+
+        return $copy;
+    }
+
+    /** @return list<string> every address of the message that is not plain ASCII */
+    private static function nonAsciiAddresses(PreparedMailMessage $message): array
+    {
+        $addresses = array_map(
+            static fn (MailRecipient $r): string => $r->email,
+            [$message->from, ...($message->replyTo === null ? [] : [$message->replyTo]), ...$message->to, ...$message->cc, ...$message->bcc],
+        );
+
+        return array_values(array_unique(array_filter($addresses, static fn (string $a): bool => preg_match('/[^\x00-\x7F]/', $a) === 1)));
+    }
+
+    /** A fully qualified domain name: dot-separated labels, a letters-only last one. */
+    public static function isDomain(string $name): bool
+    {
+        return preg_match('/^(?=.{1,253}$)([A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+[A-Za-z]{2,63}$/', $name) === 1;
+    }
+
+    /**
+     * This machine, or a one-word host (a compose service on the same
+     * network) — reached at an address that is not public. A one-word name
+     * alone proved nothing: a resolver's search domain can turn `smtp` into
+     * a server across the internet, and the password went to it in plain text.
+     *
+     * @param string $peer the connected address, "ip:port" or "[ip]:port"
+     */
+    public static function isLocalRelay(string $host, string $peer): bool
+    {
+        $host = strtolower(trim($host, '[] '));
+        $named = in_array($host, ['localhost', '127.0.0.1', '::1'], true)
+            || (filter_var($host, FILTER_VALIDATE_IP) === false && !str_contains($host, '.'));
+        $colon = strrpos($peer, ':');
+        $ip = trim($colon === false ? $peer : substr($peer, 0, $colon), '[]');
+
+        // Loopback, private and link-local addresses fail the public check.
+        return $named
+            && filter_var($ip, FILTER_VALIDATE_IP) !== false
+            && filter_var($ip, FILTER_VALIDATE_IP, FILTER_FLAG_NO_PRIV_RANGE | FILTER_FLAG_NO_RES_RANGE) === false;
+    }
+
+    private static function plaintextAuthAllowed(): bool
+    {
+        return in_array(strtolower(trim((string) Environment::getEnvValue('MAIL_ALLOW_PLAINTEXT_AUTH', ''))), ['1', 'true', 'yes', 'on'], true);
+    }
+
+    /** PLAIN when the EHLO reply offers PLAIN and not LOGIN, LOGIN otherwise. */
+    public static function authMechanism(string $ehloReply): string
+    {
+        preg_match_all('/^250[ -]AUTH[ =](.*)$/mi', $ehloReply, $m);
+        $offered = [];
+        foreach ($m[1] as $line) {
+            $offered = [...$offered, ...(preg_split('/\s+/', strtoupper(trim($line))) ?: [])];
+        }
+
+        return in_array('PLAIN', $offered, true) && !in_array('LOGIN', $offered, true) ? 'PLAIN' : 'LOGIN';
+    }
+
+    public static function isTemporary(int $smtpCode): bool
+    {
+        return $smtpCode === 0 || ($smtpCode >= 400 && $smtpCode < 500);
     }
 
     private function classifySmtpError(SmtpException $e): MailErrorCode
