@@ -11,9 +11,9 @@
     ],
     "require": {
         "php": "^8.4",
-        "semitexa/core": ">=2026.09.13.1915 || dev-master",
+        "semitexa/core": ">=2026.10.29.1052 || dev-master",
         "semitexa/locale": "*",
-        "semitexa/orm": "*",
+        "semitexa/orm": ">=2026.10.29.1052 || dev-master",
         "semitexa/ssr": "*",
         "semitexa/storage": "*"
     },
@@ -37,8 +37,8 @@
         },
         "semitexa": {
             "floors": {
-                "semitexa/core": "next",
-                "semitexa/orm": "next"
+                "semitexa/core": "2026.10.29.1052",
+                "semitexa/orm": "2026.10.29.1052"
             }
         }
     },
