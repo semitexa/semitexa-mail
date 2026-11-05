@@ -26,6 +26,27 @@ use Semitexa\Core\Attribute\Capability;
         'a mail() or raw SMTP call in a handler, blocking the response until the server answers',
         'string concatenation for the body, and base64 attachment handling written by hand',
     ],
+    usage: <<<'USAGE'
+        #[InjectAsReadonly]
+        protected MailServiceInterface $mail;
+
+        $envelope = new MailEnvelope();
+        $envelope->to = [new MailRecipient('ada@example.com', 'Ada Lovelace')];
+        $envelope->templateHandle = 'welcome';
+        $envelope->variables = ['name' => 'Ada'];
+        $envelope->idempotencyKey = 'welcome:' . $userId;
+
+        $result = $this->mail->send($envelope);
+        if (!$result->succeeded()) {
+            // $result->status, $result->errorCode, $result->errorMessage
+        }
+
+        // The template lives in the module's templates: mail/welcome.subject.txt.twig is required,
+        // with mail/welcome.body.html.twig next to it. Inline content is $envelope->subject and
+        // ->htmlBody instead. A body holding a secret, such as a reset link, sets ->sensitive.
+        // send() queues by default. With EVENTS_ASYNC=0 that delivers at once; on a real queue
+        // bin/semitexa mail:work delivers it, so check $result before telling anyone it was sent.
+        USAGE,
 )]
 final class Capabilities
 {
