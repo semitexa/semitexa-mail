@@ -57,6 +57,15 @@ final class MailLostHandoffTest extends TestCase
         $sent = $this->stored('sent', 'smtp', self::LONG_AGO);
         $recent = $this->stored('queued', 'smtp', null);
 
+        // The order assertion holds only if no other row is older than these: said, not assumed.
+        $ours = array_map(static fn (string $id): string => Uuid7::toBytes($id), $this->ids);
+        $placeholders = implode(', ', array_map(static fn (int $i): string => ':o' . $i, array_keys($ours)));
+        $older = $this->orm->getAdapter()->execute(
+            "SELECT COUNT(*) AS c FROM mail_messages WHERE created_at <= '1970-01-03 00:00:00' AND id NOT IN ({$placeholders})",
+            array_combine(array_map(static fn (int $i): string => 'o' . $i, array_keys($ours)), $ours),
+        )->rows[0]['c'] ?? null;
+        self::assertSame(0, (int) $older, 'the shared database holds mail rows dated before 1970-01-03 (left by a crashed run of this test?); delete them');
+
         $listed = array_map(static fn (MailMessage $m): string => $m->getId(), $this->repository->lostHandoffs(new \DateTimeImmutable('-15 minutes'), 500));
         $lost = array_values(array_filter($listed, fn (string $id): bool => in_array($id, $this->ids, true)));
 
