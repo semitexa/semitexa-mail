@@ -19,7 +19,11 @@ use Semitexa\Orm\OrmManager;
  */
 final class MailLostHandoffTest extends TestCase
 {
-    private const LONG_AGO = '2001-01-01 00:00:00';
+    /**
+     * Older than anything else the shared test database holds, so these rows come
+     * first in an oldest-first list however many other lost mails it carries.
+     */
+    private const LONG_AGO = '1970-01-02 00:00:00';
 
     private OrmManager $orm;
     private MailMessageRepository $repository;
@@ -47,15 +51,17 @@ final class MailLostHandoffTest extends TestCase
     public function only_unattempted_queued_or_pending_mails_untouched_since_the_cutoff_are_lost(): void
     {
         $queued = $this->stored('queued', 'smtp', self::LONG_AGO);
-        $pending = $this->stored('pending', 'smtp', '2001-01-02 00:00:00');
+        $pending = $this->stored('pending', 'smtp', '1970-01-03 00:00:00');
         $attempted = $this->stored('queued', 'smtp', self::LONG_AGO, attempts: 1);
         $sink = $this->stored('queued', 'null', self::LONG_AGO);
         $sent = $this->stored('sent', 'smtp', self::LONG_AGO);
         $recent = $this->stored('queued', 'smtp', null);
 
-        $lost = $this->ours($this->repository->lostHandoffs(new \DateTimeImmutable('-15 minutes'), 500));
+        $listed = array_map(static fn (MailMessage $m): string => $m->getId(), $this->repository->lostHandoffs(new \DateTimeImmutable('-15 minutes'), 500));
+        $lost = array_values(array_filter($listed, fn (string $id): bool => in_array($id, $this->ids, true)));
 
-        self::assertSame([$queued->getId(), $pending->getId()], $lost, 'oldest first; not the attempted, the null-driver, the sent or the recent one');
+        self::assertSame([$queued->getId(), $pending->getId()], array_slice($listed, 0, 2), 'the oldest lost mails come first');
+        self::assertSame([$queued->getId(), $pending->getId()], $lost, 'not the attempted, the null-driver, the sent or the recent one');
         self::assertNotContains($attempted->getId(), $lost);
         self::assertNotContains($sink->getId(), $lost);
         self::assertNotContains($sent->getId(), $lost);
@@ -70,7 +76,9 @@ final class MailLostHandoffTest extends TestCase
 
         self::assertTrue($this->repository->claimLostHandoff($lost, $cutoff));
         self::assertFalse($this->repository->claimLostHandoff($lost, $cutoff), 'a second sweep finds it taken');
-        self::assertSame([], $this->ours($this->repository->lostHandoffs($cutoff, 500)), 'claimed now: untouched no longer');
+        $updatedAt = $this->repository->findById($lost->getId())?->getUpdatedAt();
+        self::assertNotNull($updatedAt);
+        self::assertGreaterThan($cutoff, $updatedAt, 'claimed now: untouched no longer, so the next sweep leaves it');
         self::assertSame('queued', $this->repository->findById($lost->getId())?->getStatus(), 'the claim changes nothing but the time');
     }
 
@@ -82,7 +90,7 @@ final class MailLostHandoffTest extends TestCase
         self::assertFalse($this->repository->claimLostHandoff($attempted, new \DateTimeImmutable('-15 minutes')));
     }
 
-    /** created_at and updated_at are UTC: a zone mistake would move the boundary by hours. */
+    /** created_at and updated_at are UTC: a zone mistake would move the boundary by hours. By id, so other rows cannot matter. */
     #[Test]
     public function the_boundary_is_utc(): void
     {
@@ -91,8 +99,22 @@ final class MailLostHandoffTest extends TestCase
         $newer = $this->stored('queued', 'smtp', (new \DateTimeImmutable('-14 minutes', $utc))->format('Y-m-d H:i:s'));
         $cutoff = new \DateTimeImmutable('-15 minutes', new \DateTimeZone('America/New_York'));
 
-        self::assertSame([$older->getId()], $this->ours($this->repository->lostHandoffs($cutoff, 500)));
         self::assertFalse($this->repository->claimLostHandoff($newer, $cutoff));
+        self::assertTrue($this->repository->claimLostHandoff($older, $cutoff));
+    }
+
+    #[Test]
+    public function a_cutoff_in_the_future_is_refused_rather_than_letting_two_callers_take_one_mail(): void
+    {
+        $lost = $this->stored('queued', 'smtp', self::LONG_AGO);
+
+        try {
+            $this->repository->claimLostHandoff($lost, new \DateTimeImmutable('+1 day'));
+            self::fail('a future cutoff must be refused');
+        } catch (\InvalidArgumentException $e) {
+            self::assertSame('claimLostHandoff() takes a cutoff in the past.', $e->getMessage());
+        }
+        self::assertTrue($this->repository->claimLostHandoff($lost, new \DateTimeImmutable('-15 minutes')), 'the refused call took nothing');
     }
 
     /**

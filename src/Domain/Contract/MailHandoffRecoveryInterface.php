@@ -30,7 +30,9 @@ interface MailHandoffRecoveryInterface
      * Take $message for one more publish: true for exactly one caller while it
      * is still `queued` or `pending`, unattempted and untouched since
      * $untouchedSince. Marks it changed now, so the next sweep leaves it for a
-     * window instead of publishing a fresh copy every time.
+     * window instead of publishing a fresh copy every time. $untouchedSince
+     * must be in the past: a claim marks the row with now, and a later cutoff
+     * would let the next caller take it too (InvalidArgumentException).
      */
     public function claimLostHandoff(MailMessage $message, \DateTimeImmutable $untouchedSince): bool;
 }

@@ -217,6 +217,12 @@ class MailMessageRepository implements MailRepositoryInterface, MailRetentionInt
 
     public function claimLostHandoff(MailMessage $message, \DateTimeImmutable $untouchedSince): bool
     {
+        // The claim marks the row changed now; a cutoff after now would leave it
+        // still untouched for that cutoff, and the next caller would take it too.
+        if ($untouchedSince > new \DateTimeImmutable()) {
+            throw new \InvalidArgumentException('claimLostHandoff() takes a cutoff in the past.');
+        }
+
         return $this->orm()->getQueryAdapter()->execute(
             'UPDATE mail_messages SET updated_at = :now WHERE id = :id AND ' . self::LOST_HANDOFF,
             [
