@@ -9,6 +9,7 @@ use Semitexa\Core\Attribute\SatisfiesRepositoryContract;
 use Semitexa\Mail\Application\Db\MySQL\Model\MailMessageResource;
 use Semitexa\Mail\Domain\Model\MailMessage;
 use Semitexa\Mail\Domain\Contract\MailRepositoryInterface;
+use Semitexa\Mail\Domain\Contract\MailHandoffRecoveryInterface;
 use Semitexa\Mail\Domain\Contract\MailRecoveryInterface;
 use Semitexa\Mail\Domain\Contract\MailSendingClaimInterface;
 use Semitexa\Mail\Domain\Contract\MailOutcomeGuardInterface;
@@ -22,7 +23,7 @@ use Semitexa\Orm\Query\SystemScopeToken;
 use Semitexa\Orm\Repository\DomainRepository;
 
 #[SatisfiesRepositoryContract(of: MailRepositoryInterface::class)]
-class MailMessageRepository implements MailRepositoryInterface, MailRetentionInterface, MailRecoveryInterface, MailSendingClaimInterface, MailOutcomeGuardInterface, MailResendClaimInterface
+class MailMessageRepository implements MailRepositoryInterface, MailRetentionInterface, MailRecoveryInterface, MailSendingClaimInterface, MailOutcomeGuardInterface, MailResendClaimInterface, MailHandoffRecoveryInterface
 {
     #[InjectAsReadonly]
     protected OrmManager $orm;
@@ -189,6 +190,54 @@ class MailMessageRepository implements MailRepositoryInterface, MailRetentionInt
                 'id' => Uuid7::toBytes($message->getId()),
             ],
         )->rowCount === 1;
+    }
+
+    /** What a lost handoff is, written once for the list and the claim. */
+    private const LOST_HANDOFF = "status IN ('queued', 'pending') AND driver <> 'null'
+        AND created_at < :untouched_created AND updated_at < :untouched_updated
+        AND NOT EXISTS (SELECT 1 FROM mail_attempts a WHERE a.mail_message_id = mail_messages.id)";
+
+    public function lostHandoffs(\DateTimeImmutable $untouchedSince, int $limit): array
+    {
+        $ids = array_column($this->orm()->getQueryAdapter()->execute(
+            'SELECT id FROM mail_messages WHERE ' . self::LOST_HANDOFF . ' ORDER BY created_at LIMIT ' . max(1, min($limit, 500)),
+            self::untouched($untouchedSince),
+        )->rows, 'id');
+
+        $out = [];
+        foreach ($ids as $id) {
+            $message = is_string($id) ? $this->system()->findById(Uuid7::fromBytes($id)) : null;
+            if ($message instanceof MailMessage) {
+                $out[] = $message;
+            }
+        }
+
+        return $out;
+    }
+
+    public function claimLostHandoff(MailMessage $message, \DateTimeImmutable $untouchedSince): bool
+    {
+        // The claim marks the row changed now; a cutoff after now would leave it
+        // still untouched for that cutoff, and the next caller would take it too.
+        if ($untouchedSince > new \DateTimeImmutable()) {
+            throw new \InvalidArgumentException('claimLostHandoff() takes a cutoff in the past.');
+        }
+
+        return $this->orm()->getQueryAdapter()->execute(
+            'UPDATE mail_messages SET updated_at = :now WHERE id = :id AND ' . self::LOST_HANDOFF,
+            [
+                'now' => (new \DateTimeImmutable('now', new \DateTimeZone('UTC')))->format('Y-m-d H:i:s'),
+                'id' => Uuid7::toBytes($message->getId()),
+            ] + self::untouched($untouchedSince),
+        )->rowCount === 1;
+    }
+
+    /** @return array{untouched_created: string, untouched_updated: string} UTC, as the columns are written */
+    private static function untouched(\DateTimeImmutable $untouchedSince): array
+    {
+        $at = $untouchedSince->setTimezone(new \DateTimeZone('UTC'))->format('Y-m-d H:i:s');
+
+        return ['untouched_created' => $at, 'untouched_updated' => $at];
     }
 
     public function deleteFinishedBefore(\DateTimeImmutable $cutoff, int $limit): int
