@@ -64,6 +64,7 @@ final class MailLostHandoffTest extends TestCase
             "SELECT COUNT(*) AS c FROM mail_messages WHERE created_at <= '1970-01-03 00:00:00' AND id NOT IN ({$placeholders})",
             array_combine(array_map(static fn (int $i): string => 'o' . $i, array_keys($ours)), $ours),
         )->rows[0]['c'] ?? null;
+        self::assertNotNull($older, 'the count came back');
         self::assertSame(0, (int) $older, 'the shared database holds mail rows dated before 1970-01-03 (left by a crashed run of this test?); delete them');
 
         $listed = array_map(static fn (MailMessage $m): string => $m->getId(), $this->repository->lostHandoffs(new \DateTimeImmutable('-15 minutes'), 500));
