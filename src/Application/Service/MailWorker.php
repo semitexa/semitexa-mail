@@ -207,7 +207,9 @@ final class MailWorker
 
     /**
      * A publish can vanish after it returned: the mail sits `queued` or
-     * `pending` with no attempt, and nothing sent it again. At most every
+     * `pending` with no attempt, and nothing sent it again. So can the only
+     * worker that read it: the mail sits `sending` with no attempt, which the
+     * recovery lists once that worker is presumed dead. At most every
      * LOST_HANDOFF_SWEEP_SECONDS, a mail untouched for
      * MAIL_LOST_HANDOFF_MINUTES (15; 0 turns the sweep off) is published
      * once more, to the queue its first send used, as a recovery copy. The
@@ -219,7 +221,9 @@ final class MailWorker
     private function sweepLostHandoffs(): void
     {
         $minutes = (int) Environment::getEnvValue('MAIL_LOST_HANDOFF_MINUTES', '15');
-        if ($this->handoffRecovery === null || $minutes <= 0 || time() < $this->nextHandoffSweepAt) {
+        // Without the recovery claim no worker could take a copy: none is published.
+        if ($this->handoffRecovery === null || !$this->mailRepository instanceof MailRecoveryClaimInterface
+            || $minutes <= 0 || time() < $this->nextHandoffSweepAt) {
             return;
         }
         $this->nextHandoffSweepAt = time() + self::LOST_HANDOFF_SWEEP_SECONDS;
@@ -293,27 +297,8 @@ final class MailWorker
             return;
         }
 
-        // The sweep's copy of a mail that was only late: its first message
-        // was read meanwhile. It stops at a row that ended or that a retry
-        // chain owns: `sent`; `failed` (perhaps after the server took it:
-        // delivered here, the mail went out again); `deferred` (its own retry
-        // is on the way: a second chain of retries); `enqueue_failed` (the
-        // sender or a worker was told, and a resend under the key takes it).
-        // `sending` is not an end: when the first publish was lost, this copy
-        // is the only message there is, and its worker may have died holding
-        // the row. It goes on to the claim below as any redelivery does.
-        $recoveryClaim = false;
-        if ($message->recoveryOnly) {
-            if (!in_array($mailMessage->getStatus(), [MailMessageStatus::Queued->value, MailMessageStatus::Pending->value, MailMessageStatus::Sending->value], true)) {
-                $this->log("Mail message '{$message->messageId}' was taken by its first message ({$mailMessage->getStatus()}) — skipping the recovery copy.", 'info');
-                return;
-            }
-            // Untried at this read: taken only if still untried at the write.
-            // A project's own repository without MailRecoveryClaimInterface
-            // keeps the read above and the ordinary claim below, which takes
-            // a row that failed in between: the window this interface closes.
-            $recoveryClaim = $mailMessage->getStatus() !== MailMessageStatus::Sending->value
-                && $this->mailRepository instanceof MailRecoveryClaimInterface;
+        if ($message->recoveryOnly && !$this->claimForRecovery($message, $mailMessage)) {
+            return;
         }
 
         // Mark as sending, unless another worker on a redelivered copy has
@@ -325,22 +310,9 @@ final class MailWorker
             'status' => MailMessageStatus::Sending->value,
             'lastAttemptAt' => new \DateTimeImmutable(),
         ]);
-        if ($recoveryClaim && $this->mailRepository instanceof MailRecoveryClaimInterface) {
-            $claimed = $this->mailRepository->claimRecoveryForSending($mailMessage);
-            if (!$claimed) {
-                $status = $this->mailRepository->findById($message->messageId)?->getStatus();
-                // Another worker took it since the read. Still on it: looked
-                // at again as below. Ended any other way: that stands.
-                if ($status !== MailMessageStatus::Sending->value) {
-                    $this->log("Mail message '{$message->messageId}' was taken by its first message (" . ($status ?? 'gone') . ') — skipping the recovery copy.', 'info');
-                    return;
-                }
-            }
-        } else {
-            $claimed = !$this->mailRepository instanceof MailSendingClaimInterface
-                || $this->mailRepository->claimForSending($mailMessage, new \DateTimeImmutable('-' . MailService::ABANDONED_AFTER_SECONDS . ' seconds'));
-        }
-        if (!$claimed) {
+        // Not a recovery copy: its one claim is made above.
+        if (!$message->recoveryOnly && $this->mailRepository instanceof MailSendingClaimInterface
+            && !$this->mailRepository->claimForSending($mailMessage, new \DateTimeImmutable('-' . MailService::ABANDONED_AFTER_SECONDS . ' seconds'))) {
             if ($this->mailRepository->findById($message->messageId)?->getStatus() === MailMessageStatus::Sent->value) {
                 $this->log("Mail message '{$message->messageId}' already sent — skipping.", 'info');
                 return;
@@ -351,34 +323,15 @@ final class MailWorker
             // dead: sent by then, it is skipped; still `sending`, it is taken.
             $takeover = clone $message;
             $takeover->takeoverOnly = true;
-            // A recovery copy that met a worker on the row: the takeover
-            // rule decides now. Still marked, the copy was skipped at any
-            // status, and a mail whose worker died stayed `sending` for good.
-            $takeover->recoveryOnly = false;
             if ($this->republishLater($takeover, MailService::ABANDONED_AFTER_SECONDS + 5)) {
                 $this->log("Mail message '{$message->messageId}' is being sent by another worker — looking again later.", 'info');
                 return;
             }
-            // A recovery copy never delivers beside a worker that holds the
-            // row: that worker owns the send, and going on from here sent the
-            // mail twice (the outcome guard lets a `sending` row through).
-            // Thrown back instead: the queue keeps the message and delivers
-            // it again (NATS and the database queue nak on a throw), and it
-            // meets the row as that worker left it. The in-memory queue
-            // redelivers nothing, and a throw would end its consumer: there
-            // the copy is dropped, and said.
-            if ($message->recoveryOnly) {
-                $why = "Recovery copy of mail '{$message->messageId}' met a worker sending it and could not be held back for the takeover window";
-                if (QueueConfig::isProcessLocal($this->currentTransport ?? QueueConfig::defaultTransport())) {
-                    $this->log("{$why}: dropped, that worker owns the send.", 'warning');
-                    return;
-                }
-                throw new \RuntimeException("{$why}: left on the queue.");
-            }
-            // An ordinary redelivery on a transport that cannot hold it back
-            // (or whose delayed publish failed): delivered as before rather
-            // than lost, at the risk of a second delivery. That is how it was
-            // before recovery copies existed, and is not changed here.
+            // A transport that cannot hold it back (or whose delayed publish
+            // failed): delivered as before rather than lost, at the risk of a
+            // second delivery beside the worker holding the row. That is how
+            // an ordinary redelivery was handled before recovery copies
+            // existed, and is not changed with them.
         }
         if (!$this->saveOutcomeUnlessSent($mailMessage)) {
             $this->log("Mail message '{$message->messageId}' already sent — skipping.", 'info');
@@ -557,6 +510,33 @@ final class MailWorker
         ]))) {
             $this->outcome = 'dead_lettered';
         }
+    }
+
+    /**
+     * The sweep's copy of a mail takes it through one conditional write, or
+     * not at all. The sweep cannot tell a lost publish from one still waiting
+     * in the broker, so by the time its copy is read the mail may be anywhere:
+     * sent, failed (perhaps after the server took it), deferred with a retry
+     * on the way, or with a worker on it. Reading the status and then
+     * claiming left a window at every one of those; the write takes the row
+     * only while nothing has tried it — `queued` or `pending`, or `sending`
+     * by a worker presumed dead (untouched for ABANDONED_AFTER_SECONDS, as
+     * the ordinary takeover reads it). Refused, the copy is done: nothing is
+     * delivered, thrown or published again. A mail whose worker dies later
+     * is found by the next sweep, which lists such a `sending` row too.
+     *
+     * A project's own repository without MailRecoveryClaimInterface has no
+     * such write: the sweep does not run for it, and a copy is skipped.
+     */
+    private function claimForRecovery(QueuedMailMessage $message, MailMessage $mailMessage): bool
+    {
+        if ($this->mailRepository instanceof MailRecoveryClaimInterface
+            && $this->mailRepository->claimRecoveryForSending($mailMessage, new \DateTimeImmutable('-' . MailService::ABANDONED_AFTER_SECONDS . ' seconds'))) {
+            return true;
+        }
+        $this->log("Mail message '{$message->messageId}' is not waiting untried ({$mailMessage->getStatus()} when read) — skipping the recovery copy.", 'info');
+
+        return false;
     }
 
     /** The same queue message again, its attempts and queuedAt unchanged, $delay seconds later. */

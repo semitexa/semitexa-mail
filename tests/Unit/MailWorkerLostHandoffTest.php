@@ -14,6 +14,7 @@ use Semitexa\Mail\Application\Service\MailWorker;
 use Semitexa\Mail\Domain\Contract\MailAttemptRepositoryInterface;
 use Semitexa\Mail\Domain\Contract\MailerConfigResolverInterface;
 use Semitexa\Mail\Domain\Contract\MailHandoffRecoveryInterface;
+use Semitexa\Mail\Domain\Contract\MailRecoveryClaimInterface;
 use Semitexa\Mail\Domain\Contract\MailRepositoryInterface;
 use Semitexa\Mail\Domain\Model\MailerConfig;
 use Semitexa\Mail\Domain\Model\MailMessage;
@@ -243,7 +244,27 @@ final class MailWorkerLostHandoffTest extends TestCase
         self::assertSame("Unexpected message type 'other' on mail queue — skipping.\n", $this->output->fetch());
     }
 
-    private function worker(?MailHandoffRecoveryInterface $recovery): MailWorker
+    /**
+     * A project's own repository without the recovery claim: no worker could
+     * take a copy by one write, so none is published and one that arrives is
+     * skipped.
+     */
+    #[Test]
+    public function a_repository_without_the_recovery_claim_gets_no_sweep_and_delivers_no_recovery_copy(): void
+    {
+        $recovery = new MailWorkerHandoffRecovery([$this->mail('m-1')]);
+        $repository = $this->createMock(MailRepositoryInterface::class);
+        $repository->method('findById')->willReturn($this->mail('m-1'));
+        $repository->expects(self::never())->method('save');
+
+        $this->worker($recovery, $repository)->processPayload('{"type":"mail","messageId":"m-1","recoveryOnly":true}');
+
+        self::assertSame([], $recovery->cutoffs);
+        self::assertSame([], $this->queue->published);
+        self::assertSame("Mail message 'm-1' is not waiting untried (queued when read) — skipping the recovery copy.\n", $this->output->fetch());
+    }
+
+    private function worker(?MailHandoffRecoveryInterface $recovery, ?MailRepositoryInterface $repository = null): MailWorker
     {
         $config = new class implements MailerConfigResolverInterface {
             public function resolve(?string $tenantId = null, ?string $mailerKey = null): MailerConfig
@@ -256,7 +277,7 @@ final class MailWorkerLostHandoffTest extends TestCase
             }
         };
         $worker = new MailWorker(
-            self::createStub(MailRepositoryInterface::class),
+            $repository ?? self::createStubForIntersectionOfInterfaces([MailRepositoryInterface::class, MailRecoveryClaimInterface::class]),
             self::createStub(MailAttemptRepositoryInterface::class),
             $config,
             (new \ReflectionClass(AttachmentResolver::class))->newInstanceWithoutConstructor(),

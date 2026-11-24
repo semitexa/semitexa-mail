@@ -11,15 +11,17 @@ use Semitexa\Mail\Domain\Model\MailMessage;
  * lost-handoff sweep published for a mail that looked lost. The mail's first
  * message may only have been late, so the copy may take the mail only while
  * nothing has tried it. Kept apart from MailSendingClaimInterface so a
- * project's own repository does not break; without it the worker reads the
- * status and then claims, and a mail that failed in between is sent again.
+ * project's own repository does not break; without it mail:work runs no
+ * lost-handoff sweep and delivers no recovery copy.
  */
 interface MailRecoveryClaimInterface
 {
     /**
-     * Mark $message `sending` only while it is `queued` or `pending` with no
-     * attempt, in one write: true for exactly one of two concurrent callers,
-     * false once any worker has taken, sent, deferred or failed it.
+     * Mark $message `sending`, in one write, only while it has no attempt and
+     * is `queued` or `pending`, or `sending` and last changed before
+     * $abandonedBefore (the worker that took it is presumed dead). True for
+     * exactly one of two concurrent callers; false once a worker holds it or
+     * has sent, deferred or failed it.
      */
-    public function claimRecoveryForSending(MailMessage $message): bool;
+    public function claimRecoveryForSending(MailMessage $message, \DateTimeImmutable $abandonedBefore): bool;
 }

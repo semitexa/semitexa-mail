@@ -7,6 +7,7 @@ namespace Semitexa\Mail\Application\Db\MySQL\Repository;
 use Semitexa\Core\Attribute\InjectAsReadonly;
 use Semitexa\Core\Attribute\SatisfiesRepositoryContract;
 use Semitexa\Mail\Application\Db\MySQL\Model\MailMessageResource;
+use Semitexa\Mail\Application\Service\MailService;
 use Semitexa\Mail\Domain\Model\MailMessage;
 use Semitexa\Mail\Domain\Contract\MailRepositoryInterface;
 use Semitexa\Mail\Domain\Contract\MailHandoffRecoveryInterface;
@@ -182,19 +183,21 @@ class MailMessageRepository implements MailRepositoryInterface, MailRetentionInt
         )->rowCount === 1;
     }
 
-    public function claimRecoveryForSending(MailMessage $message): bool
+    public function claimRecoveryForSending(MailMessage $message, \DateTimeImmutable $abandonedBefore): bool
     {
-        $now = (new \DateTimeImmutable('now', new \DateTimeZone('UTC')))->format('Y-m-d H:i:s');
+        $utc = new \DateTimeZone('UTC');
+        $now = (new \DateTimeImmutable('now', $utc))->format('Y-m-d H:i:s');
 
         // One write: read first, a mail its first message failed in between
         // (perhaps after the server took it) was claimed and sent again.
         return $this->orm()->getQueryAdapter()->execute(
             "UPDATE mail_messages SET status = 'sending', last_attempt_at = :now_attempt, updated_at = :now
-             WHERE id = :id AND status IN ('queued', 'pending')
+             WHERE id = :id AND (status IN ('queued', 'pending') OR (status = 'sending' AND updated_at < :abandoned))
                AND NOT EXISTS (SELECT 1 FROM mail_attempts a WHERE a.mail_message_id = mail_messages.id)",
             [
                 'now_attempt' => $now,
                 'now' => $now,
+                'abandoned' => $abandonedBefore->setTimezone($utc)->format('Y-m-d H:i:s'),
                 'id' => Uuid7::toBytes($message->getId()),
             ],
         )->rowCount === 1;
@@ -212,7 +215,8 @@ class MailMessageRepository implements MailRepositoryInterface, MailRetentionInt
     }
 
     /** What a lost handoff is, written once for the list and the claim. */
-    private const LOST_HANDOFF = "status IN ('queued', 'pending') AND driver <> 'null'
+    private const LOST_HANDOFF = "(status IN ('queued', 'pending') OR (status = 'sending' AND updated_at < :abandoned))
+        AND driver <> 'null'
         AND created_at < :untouched_created AND updated_at < :untouched_updated
         AND NOT EXISTS (SELECT 1 FROM mail_attempts a WHERE a.mail_message_id = mail_messages.id)";
 
@@ -243,7 +247,9 @@ class MailMessageRepository implements MailRepositoryInterface, MailRetentionInt
         }
 
         return $this->orm()->getQueryAdapter()->execute(
-            'UPDATE mail_messages SET updated_at = :now WHERE id = :id AND ' . self::LOST_HANDOFF,
+            // Left to right: the CASE reads the status the row had.
+            "UPDATE mail_messages SET status = CASE WHEN status = 'sending' THEN 'queued' ELSE status END, updated_at = :now
+             WHERE id = :id AND " . self::LOST_HANDOFF,
             [
                 'now' => (new \DateTimeImmutable('now', new \DateTimeZone('UTC')))->format('Y-m-d H:i:s'),
                 'id' => Uuid7::toBytes($message->getId()),
@@ -251,12 +257,18 @@ class MailMessageRepository implements MailRepositoryInterface, MailRetentionInt
         )->rowCount === 1;
     }
 
-    /** @return array{untouched_created: string, untouched_updated: string} UTC, as the columns are written */
+    /** @return array{untouched_created: string, untouched_updated: string, abandoned: string} UTC, as the columns are written */
     private static function untouched(\DateTimeImmutable $untouchedSince): array
     {
-        $at = $untouchedSince->setTimezone(new \DateTimeZone('UTC'))->format('Y-m-d H:i:s');
+        $utc = new \DateTimeZone('UTC');
+        $at = $untouchedSince->setTimezone($utc)->format('Y-m-d H:i:s');
 
-        return ['untouched_created' => $at, 'untouched_updated' => $at];
+        return [
+            'untouched_created' => $at,
+            'untouched_updated' => $at,
+            // A `sending` row is its worker's for as long as the takeover window.
+            'abandoned' => (new \DateTimeImmutable('-' . MailService::ABANDONED_AFTER_SECONDS . ' seconds', $utc))->format('Y-m-d H:i:s'),
+        ];
     }
 
     public function deleteFinishedBefore(\DateTimeImmutable $cutoff, int $limit): int
