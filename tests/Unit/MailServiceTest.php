@@ -929,6 +929,78 @@ final class MailServiceTest extends TestCase
         self::assertSame('sent', $this->messages->byId($id)?->getStatus());
     }
 
+    /** @return iterable<string, array{string, ?string, int, string}> */
+    public static function recoveryCopies(): iterable
+    {
+        // [the row's status when the copy is read, its error code, deliveries, the status after]
+        yield 'failed, perhaps after the server took it' => ['failed', 'unknown_transport_error', 0, 'failed'];
+        yield 'deferred, its own retry on the way' => ['deferred', 'timeout', 0, 'deferred'];
+        yield 'sent' => ['sent', null, 0, 'sent'];
+        yield 'still queued: the first message was lost' => ['queued', null, 1, 'sent'];
+        yield 'still pending' => ['pending', null, 1, 'sent'];
+    }
+
+    /**
+     * tk-mail-lost-handoff-no-recovery: the sweep cannot tell a lost publish
+     * from one still waiting in the broker. Its copy, read after the first
+     * message was, delivered a failed mail again and retried a deferred one
+     * beside its own retry.
+     */
+    #[Test]
+    #[\PHPUnit\Framework\Attributes\DataProvider('recoveryCopies')]
+    public function a_recovery_copy_delivers_only_a_mail_still_untried(string $status, ?string $errorCode, int $deliveries, string $after): void
+    {
+        $this->spyOnTheQueue();
+        $id = $this->queuedMessage();
+        $this->messages->save(($this->messages->byId($id) ?? self::fail('not stored'))->with(['status' => $status, 'errorCode' => $errorCode]));
+
+        $this->worker()->processPayload((new QueuedMailMessage(messageId: $id, recoveryOnly: true))->toJson());
+
+        self::assertSame($deliveries, $this->fake->count());
+        self::assertSame($after, $this->messages->byId($id)?->getStatus());
+        self::assertSame($errorCode, $this->messages->byId($id)?->getErrorCode());
+        self::assertSame([], MailServiceQueueSpy::$published, 'no retry of its own');
+    }
+
+    #[Test]
+    public function the_first_send_publishes_no_recovery_copy_and_an_older_message_is_not_one(): void
+    {
+        $this->spyOnTheQueue();
+        $id = (string) $this->service()->send($this->envelope(subject: 'Once', text: 'x'), new MailSendOptions(mode: MailSendMode::Queued))->messageId;
+
+        self::assertCount(1, MailServiceQueueSpy::$published);
+        $first = json_decode(MailServiceQueueSpy::$published[0][1], true, 512, JSON_THROW_ON_ERROR);
+        self::assertIsArray($first);
+        unset($first['queuedAt']);
+        self::assertSame(
+            ['type' => 'mail', 'messageId' => $id, 'attempts' => 0, 'maxRetries' => 3, 'retryDelay' => 60, 'takeoverOnly' => false, 'recoveryOnly' => false],
+            $first,
+        );
+        // Published before the field existed: read as an ordinary message.
+        self::assertFalse(QueuedMailMessage::fromJson('{"type":"mail","messageId":"m-1","takeoverOnly":false}')->recoveryOnly);
+        self::assertTrue(QueuedMailMessage::fromJson('{"type":"mail","messageId":"m-1","recoveryOnly":true}')->recoveryOnly);
+    }
+
+    #[Test]
+    public function a_retry_of_a_recovery_copy_is_an_ordinary_message(): void
+    {
+        $this->spyOnTheQueue();
+        $id = $this->queuedMessage();
+        MailTransportRegistry::register(new MailServiceScriptedTransport(new MailTransportResult(status: MailTransportStatus::Failed, errorCode: 'timeout', errorMessage: 'SMTP timed out')));
+
+        $this->worker(driver: 'scripted')->processPayload((new QueuedMailMessage(messageId: $id, maxRetries: 2, retryDelay: 0, recoveryOnly: true))->toJson());
+
+        self::assertSame('deferred', $this->messages->byId($id)?->getStatus());
+        self::assertCount(1, MailServiceQueueSpy::$published);
+        $retry = QueuedMailMessage::fromJson(MailServiceQueueSpy::$published[0][1]);
+        self::assertFalse($retry->recoveryOnly, 'still marked, it met the deferred row and was skipped');
+
+        $this->worker()->processPayload($retry->toJson());
+
+        self::assertSame(1, $this->fake->count());
+        self::assertSame('sent', $this->messages->byId($id)?->getStatus());
+    }
+
     /** A partial refusal's warning named every refused address and the server's reply in the log. */
     #[Test]
     public function a_partial_refusal_is_logged_as_a_count_not_the_addresses(): void

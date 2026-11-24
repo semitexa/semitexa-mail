@@ -10,6 +10,7 @@ use Semitexa\Core\Attribute\InjectAsReadonly;
 use Semitexa\Mail\Application\Service\AttachmentResolver;
 use Semitexa\Mail\Application\Service\MailWorker;
 use Semitexa\Mail\Domain\Contract\MailAttemptRepositoryInterface;
+use Semitexa\Mail\Domain\Contract\MailHandoffRecoveryInterface;
 use Semitexa\Mail\Domain\Contract\MailerConfigResolverInterface;
 use Semitexa\Mail\Domain\Contract\MailRepositoryInterface;
 use Semitexa\Mail\Domain\Contract\MailRetentionInterface;
@@ -71,7 +72,9 @@ final class MailWorkCommand extends Command
             if ($retention === null && (int) \Semitexa\Core\Environment::getEnvValue('MAIL_RETENTION_DAYS', '0') > 0) {
                 $output->writeln('<comment>MAIL_RETENTION_DAYS is set, but the bound mail repository does not implement MailRetentionInterface: nothing is deleted.</comment>');
             }
-            $worker = new MailWorker($mailRepository, $attemptRepo, $configResolver, $attachResolver, $retention);
+            // A project's own repository without it: lost handoffs are not swept, as before.
+            $handoffRecovery = $mailRepository instanceof MailHandoffRecoveryInterface ? $mailRepository : null;
+            $worker = new MailWorker($mailRepository, $attemptRepo, $configResolver, $attachResolver, $retention, $handoffRecovery);
             $worker->setOutput($output);
             $worker->run($transport, $queue);
         } catch (\Throwable $e) {

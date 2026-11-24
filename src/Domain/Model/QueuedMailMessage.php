@@ -20,6 +20,14 @@ final class QueuedMailMessage implements \JsonSerializable
          * status — a `deferred` or `failed` it ended with is not sent again.
          */
         public bool $takeoverOnly = false,
+        /**
+         * A copy the worker's sweep published for a mail that looked lost:
+         * the first message may only be late (a backlog), and by the time
+         * this one is read the mail may have been tried. It is delivered only
+         * while the row is still `queued` or `pending`. A message without the
+         * field is not such a copy.
+         */
+        public bool $recoveryOnly = false,
     ) {
         $this->queuedAt = $queuedAt ?: date(DATE_ATOM);
     }
@@ -34,6 +42,7 @@ final class QueuedMailMessage implements \JsonSerializable
             'maxRetries' => $this->maxRetries,
             'retryDelay' => $this->retryDelay,
             'takeoverOnly' => $this->takeoverOnly,
+            'recoveryOnly' => $this->recoveryOnly,
         ];
     }
 
@@ -53,6 +62,7 @@ final class QueuedMailMessage implements \JsonSerializable
             maxRetries: $data['maxRetries'] ?? 3,
             retryDelay: $data['retryDelay'] ?? 60,
             takeoverOnly: ($data['takeoverOnly'] ?? false) === true,
+            recoveryOnly: is_array($data) && ($data['recoveryOnly'] ?? false) === true,
         );
     }
 }

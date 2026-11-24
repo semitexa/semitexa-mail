@@ -399,20 +399,30 @@ final class MailService implements MailServiceInterface
         }
     }
 
+    /**
+     * A stored mail's first message to the queue, on the transport every
+     * sender uses. Written once: the worker's lost-handoff sweep publishes a
+     * mail again with what the first send published, marked $recoveryOnly so
+     * a worker delivers it only while the mail is still untried.
+     */
+    public static function publishHandoff(string $messageId, string $queueName, bool $recoveryOnly = false): void
+    {
+        QueueTransportRegistry::create(QueueConfig::defaultTransport())
+            ->publish($queueName, (new QueuedMailMessage(messageId: $messageId, recoveryOnly: $recoveryOnly))->toJson());
+    }
+
     private function dispatchToQueue(
         MailMessage $mailMessage,
         string $messageId,
         string $queueName,
     ): MailDispatchResult {
         try {
-            $transport    = QueueTransportRegistry::create(QueueConfig::defaultTransport());
-            $queueMessage = new QueuedMailMessage(messageId: $messageId);
             // Queued before the publish: saved after, it could overwrite the
             // `sent` a fast worker had already written.
             $mailMessage = $this->mailRepository->save($mailMessage->with([
                 'status' => MailMessageStatus::Queued->value,
             ]));
-            $transport->publish($queueName, $queueMessage->toJson());
+            self::publishHandoff($messageId, $queueName);
 
             return new MailDispatchResult(
                 status:    MailDispatchStatus::Queued,

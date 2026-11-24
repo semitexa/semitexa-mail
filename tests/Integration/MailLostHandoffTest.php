@@ -6,10 +6,20 @@ namespace Semitexa\Mail\Tests\Integration;
 
 use PHPUnit\Framework\Attributes\Test;
 use PHPUnit\Framework\TestCase;
+use Semitexa\Core\Queue\QueueTransportFactoryInterface;
+use Semitexa\Core\Queue\QueueTransportInterface;
+use Semitexa\Core\Queue\QueueTransportRegistry;
 use Semitexa\Mail\Application\Db\MySQL\Repository\MailMessageRepository;
+use Semitexa\Mail\Application\Service\AttachmentResolver;
+use Semitexa\Mail\Application\Service\MailWorker;
+use Semitexa\Mail\Domain\Contract\MailAttemptRepositoryInterface;
+use Semitexa\Mail\Domain\Contract\MailerConfigResolverInterface;
+use Semitexa\Mail\Domain\Contract\MailHandoffRecoveryInterface;
+use Semitexa\Mail\Domain\Model\MailerConfig;
 use Semitexa\Mail\Domain\Model\MailMessage;
 use Semitexa\Orm\Application\Service\Uuid7;
 use Semitexa\Orm\OrmManager;
+use Symfony\Component\Console\Output\NullOutput;
 
 /**
  * orm-gap-7-package-read-apis: a mail the queue accepted and then lost sits
@@ -125,6 +135,111 @@ final class MailLostHandoffTest extends TestCase
             self::assertSame('claimLostHandoff() takes a cutoff in the past.', $e->getMessage());
         }
         self::assertTrue($this->repository->claimLostHandoff($lost, new \DateTimeImmutable('-15 minutes')), 'the refused call took nothing');
+    }
+
+    /**
+     * tk-mail-lost-handoff-no-recovery: nothing called the two methods above.
+     * mail:work's sweep does, and a second worker sweeping right after the
+     * first publishes nothing: the claim touched the row.
+     */
+    #[Test]
+    public function the_worker_publishes_a_lost_mail_once_however_many_workers_sweep(): void
+    {
+        $lost = $this->stored('queued', 'smtp', self::LONG_AGO);
+        $pending = $this->stored('pending', 'smtp', '1970-01-03 00:00:00');
+        $this->stored('queued', 'smtp', self::LONG_AGO, attempts: 1);
+        $this->stored('queued', 'null', self::LONG_AGO);
+        $this->stored('queued', 'smtp', null);
+
+        $queue = new class implements QueueTransportInterface {
+            /** @var list<array{string, mixed}> queue and decoded message */
+            public array $published = [];
+
+            public function publish(string $queueName, string $payload): void
+            {
+                $this->published[] = [$queueName, json_decode($payload, true)];
+            }
+
+            public function consume(string $queueName, callable $callback): void
+            {
+            }
+        };
+        $eventsTransport = getenv('EVENTS_TRANSPORT');
+        $handoffMinutes = getenv('MAIL_LOST_HANDOFF_MINUTES');
+        $registry = [];
+        foreach ((new \ReflectionClass(QueueTransportRegistry::class))->getProperties(\ReflectionProperty::IS_STATIC) as $property) {
+            $registry[$property->getName()] = $property->getValue();
+        }
+        QueueTransportRegistry::register('mail-lost-handoff-test', new class($queue) implements QueueTransportFactoryInterface {
+            public function __construct(private readonly QueueTransportInterface $queue)
+            {
+            }
+
+            public function create(): QueueTransportInterface
+            {
+                return $this->queue;
+            }
+        });
+        putenv('EVENTS_TRANSPORT=mail-lost-handoff-test');
+        putenv('MAIL_LOST_HANDOFF_MINUTES');
+        try {
+            $this->worker()->processPayload('{"type":"other"}');
+            $this->worker()->processPayload('{"type":"other"}');
+        } finally {
+            putenv($eventsTransport === false ? 'EVENTS_TRANSPORT' : 'EVENTS_TRANSPORT=' . $eventsTransport);
+            putenv($handoffMinutes === false ? 'MAIL_LOST_HANDOFF_MINUTES' : 'MAIL_LOST_HANDOFF_MINUTES=' . $handoffMinutes);
+            foreach ($registry as $name => $value) {
+                (new \ReflectionProperty(QueueTransportRegistry::class, $name))->setValue(null, $value);
+            }
+        }
+
+        self::assertSame(
+            [['mail-handoff', $lost->getId(), 0, true], ['mail-handoff', $pending->getId(), 0, true]],
+            array_map(static fn (array $p): array => [$p[0], $p[1]['messageId'] ?? null, $p[1]['attempts'] ?? null, $p[1]['recoveryOnly'] ?? null], $queue->published),
+            'each lost mail once; not the attempted, the null-driver or the recent one',
+        );
+        self::assertSame('queued', $this->repository->findById($lost->getId())?->getStatus());
+        self::assertSame('pending', $this->repository->findById($pending->getId())?->getStatus());
+    }
+
+    /** A worker whose sweep sees only this test's rows: the shared database's other lost mails are not touched. */
+    private function worker(): MailWorker
+    {
+        $ours = new class($this->repository, fn (array $messages): array => array_values(array_filter(
+            $messages,
+            fn (MailMessage $m): bool => in_array($m->getId(), $this->ids, true),
+        ))) implements MailHandoffRecoveryInterface {
+            public function __construct(private readonly MailMessageRepository $repository, private readonly \Closure $ours)
+            {
+            }
+
+            public function lostHandoffs(\DateTimeImmutable $untouchedSince, int $limit): array
+            {
+                return ($this->ours)($this->repository->lostHandoffs($untouchedSince, $limit));
+            }
+
+            public function claimLostHandoff(MailMessage $message, \DateTimeImmutable $untouchedSince): bool
+            {
+                return $this->repository->claimLostHandoff($message, $untouchedSince);
+            }
+        };
+        $config = new class implements MailerConfigResolverInterface {
+            public function resolve(?string $tenantId = null, ?string $mailerKey = null): MailerConfig
+            {
+                return new MailerConfig(queue: 'mail-handoff');
+            }
+        };
+        $worker = new MailWorker(
+            $this->repository,
+            self::createStub(MailAttemptRepositoryInterface::class),
+            $config,
+            (new \ReflectionClass(AttachmentResolver::class))->newInstanceWithoutConstructor(),
+            null,
+            $ours,
+        );
+        $worker->setOutput(new NullOutput());
+
+        return $worker;
     }
 
     /**
