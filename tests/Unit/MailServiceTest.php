@@ -1037,6 +1037,99 @@ final class MailServiceTest extends TestCase
         self::assertSame('sent', $this->messages->byId($id)?->getStatus());
     }
 
+    /** @return iterable<string, array{string}> */
+    public static function takeoversThatCannotBeScheduled(): iterable
+    {
+        yield 'the delayed publish throws' => ['mail-test-delay-refused'];
+        yield 'the transport cannot hold a message back' => ['mail-test-spy'];
+    }
+
+    /**
+     * semitexa-mail#29, round 2: with no takeover copy scheduled, the recovery
+     * copy went on to deliver beside the live worker holding the row, and the
+     * mail was sent twice. It is thrown back to the queue instead, which
+     * delivers it again later.
+     */
+    #[Test]
+    #[\PHPUnit\Framework\Attributes\DataProvider('takeoversThatCannotBeScheduled')]
+    public function a_recovery_copy_never_delivers_beside_a_live_worker_when_no_takeover_can_be_scheduled(string $transport): void
+    {
+        QueueTransportRegistry::register('mail-test-delay-refused', new class implements \Semitexa\Core\Queue\QueueTransportFactoryInterface {
+            public function create(): \Semitexa\Core\Queue\QueueTransportInterface
+            {
+                return new class implements \Semitexa\Core\Queue\DelayedQueueTransportInterface {
+                    public function publish(string $queueName, string $payload): void
+                    {
+                    }
+
+                    public function publishDelayed(string $queueName, string $payload, int $delaySeconds): void
+                    {
+                        throw new \RuntimeException('broker away');
+                    }
+
+                    public function consume(string $queueName, callable $callback): void
+                    {
+                    }
+                };
+            }
+        });
+        $this->spyOnTheQueue();
+        $id = $this->queuedMessage();
+        putenv('EVENTS_TRANSPORT=' . $transport);
+        $this->messages->save(($this->messages->byId($id) ?? self::fail('not stored'))->with(['status' => 'sending']));
+        $this->messages->heldByAnotherWorker[$id] = true;
+
+        $thrown = null;
+        try {
+            $this->worker()->processPayload((new QueuedMailMessage(messageId: $id, recoveryOnly: true))->toJson());
+        } catch (\Throwable $e) {
+            $thrown = $e;
+        }
+
+        self::assertSame(0, $this->fake->count(), 'the worker holding the row owns the send');
+        self::assertInstanceOf(\RuntimeException::class, $thrown, 'thrown back: the queue naks it and delivers it again');
+        self::assertSame("Recovery copy of mail '{$id}' met a worker sending it and could not be held back for the takeover window: left on the queue.", $thrown->getMessage());
+        self::assertSame('sending', $this->messages->byId($id)?->getStatus(), 'the row is that worker\'s, untouched');
+        self::assertSame([], $this->attempts->saved);
+        self::assertSame([], MailServiceQueueSpy::$published);
+    }
+
+    #[Test]
+    public function on_the_in_memory_queue_such_a_recovery_copy_is_dropped_and_said(): void
+    {
+        $this->spyOnTheQueue();
+        $id = $this->queuedMessage();
+        // Nothing redelivers there, and a throw would end the consumer.
+        putenv('EVENTS_TRANSPORT');
+        putenv('EVENTS_ASYNC=0');
+        $this->messages->save(($this->messages->byId($id) ?? self::fail('not stored'))->with(['status' => 'sending']));
+        $this->messages->heldByAnotherWorker[$id] = true;
+        $output = new \Symfony\Component\Console\Output\BufferedOutput();
+        $worker = $this->worker();
+        $worker->setOutput($output);
+
+        $worker->processPayload((new QueuedMailMessage(messageId: $id, recoveryOnly: true))->toJson());
+
+        self::assertSame(0, $this->fake->count());
+        self::assertSame('sending', $this->messages->byId($id)?->getStatus());
+        self::assertSame("Recovery copy of mail '{$id}' met a worker sending it and could not be held back for the takeover window: dropped, that worker owns the send.\n", $output->fetch());
+    }
+
+    /** Not changed by the recovery copy's rule: an ordinary redelivery is delivered rather than lost. */
+    #[Test]
+    public function an_ordinary_redelivery_that_cannot_be_held_back_is_still_delivered(): void
+    {
+        $this->spyOnTheQueue();
+        $id = $this->queuedMessage();
+        $this->messages->save(($this->messages->byId($id) ?? self::fail('not stored'))->with(['status' => 'sending']));
+        $this->messages->heldByAnotherWorker[$id] = true;
+
+        $this->worker()->processPayload((new QueuedMailMessage(messageId: $id))->toJson());
+
+        self::assertSame(1, $this->fake->count());
+        self::assertSame('sent', $this->messages->byId($id)?->getStatus());
+    }
+
     #[Test]
     public function a_redelivered_recovery_copy_takes_over_a_mail_its_dead_worker_left_sending(): void
     {

@@ -359,8 +359,26 @@ final class MailWorker
                 $this->log("Mail message '{$message->messageId}' is being sent by another worker — looking again later.", 'info');
                 return;
             }
-            // A transport that cannot hold it back: delivered as before
-            // rather than lost, at the risk of a second delivery.
+            // A recovery copy never delivers beside a worker that holds the
+            // row: that worker owns the send, and going on from here sent the
+            // mail twice (the outcome guard lets a `sending` row through).
+            // Thrown back instead: the queue keeps the message and delivers
+            // it again (NATS and the database queue nak on a throw), and it
+            // meets the row as that worker left it. The in-memory queue
+            // redelivers nothing, and a throw would end its consumer: there
+            // the copy is dropped, and said.
+            if ($message->recoveryOnly) {
+                $why = "Recovery copy of mail '{$message->messageId}' met a worker sending it and could not be held back for the takeover window";
+                if (QueueConfig::isProcessLocal($this->currentTransport ?? QueueConfig::defaultTransport())) {
+                    $this->log("{$why}: dropped, that worker owns the send.", 'warning');
+                    return;
+                }
+                throw new \RuntimeException("{$why}: left on the queue.");
+            }
+            // An ordinary redelivery on a transport that cannot hold it back
+            // (or whose delayed publish failed): delivered as before rather
+            // than lost, at the risk of a second delivery. That is how it was
+            // before recovery copies existed, and is not changed here.
         }
         if (!$this->saveOutcomeUnlessSent($mailMessage)) {
             $this->log("Mail message '{$message->messageId}' already sent — skipping.", 'info');
