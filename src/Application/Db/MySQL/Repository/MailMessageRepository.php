@@ -223,7 +223,11 @@ class MailMessageRepository implements MailRepositoryInterface, MailRetentionInt
     public function lostHandoffs(\DateTimeImmutable $untouchedSince, int $limit): array
     {
         $ids = array_column($this->orm()->getQueryAdapter()->execute(
-            'SELECT id FROM mail_messages WHERE ' . self::LOST_HANDOFF . ' ORDER BY created_at LIMIT ' . max(1, min($limit, 500)),
+            // The longest untouched first, not the oldest created: a claim touches
+            // the row, so one claimed and not published (its mailer cannot be
+            // resolved) goes to the back. Ordered by created_at, more such rows
+            // than one batch holds kept every later lost mail out for good.
+            'SELECT id FROM mail_messages WHERE ' . self::LOST_HANDOFF . ' ORDER BY updated_at, id LIMIT ' . max(1, min($limit, 500)),
             self::untouched($untouchedSince),
         )->rows, 'id');
 

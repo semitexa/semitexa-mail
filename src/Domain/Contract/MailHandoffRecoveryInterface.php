@@ -18,7 +18,7 @@ interface MailHandoffRecoveryInterface
 {
     /**
      * Mails `queued` or `pending` with no attempt at all, created and last
-     * changed before $untouchedSince, across every tenant, oldest first: up to
+     * changed before $untouchedSince, across every tenant, the longest untouched first (so a mail claimed and not published goes to the back): up to
      * $limit, at most 500. A mail with an attempt is the worker's (its retries
      * own it), and one for the `null` driver goes nowhere, so neither is here.
      * Also a mail `sending` with no attempt, last changed before

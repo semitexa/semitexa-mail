@@ -71,7 +71,7 @@ final class MailLostHandoffTest extends TestCase
         $ours = array_map(static fn (string $id): string => Uuid7::toBytes($id), $this->ids);
         $placeholders = implode(', ', array_map(static fn (int $i): string => ':o' . $i, array_keys($ours)));
         $older = $this->orm->getAdapter()->execute(
-            "SELECT COUNT(*) AS c FROM mail_messages WHERE created_at <= '1970-01-03 00:00:00' AND id NOT IN ({$placeholders})",
+            "SELECT COUNT(*) AS c FROM mail_messages WHERE updated_at <= '1970-01-03 00:00:00' AND id NOT IN ({$placeholders})",
             array_combine(array_map(static fn (int $i): string => 'o' . $i, array_keys($ours)), $ours),
         )->rows[0]['c'] ?? null;
         self::assertNotNull($older, 'the count came back');
@@ -80,12 +80,32 @@ final class MailLostHandoffTest extends TestCase
         $listed = array_map(static fn (MailMessage $m): string => $m->getId(), $this->repository->lostHandoffs(new \DateTimeImmutable('-15 minutes'), 500));
         $lost = array_values(array_filter($listed, fn (string $id): bool => in_array($id, $this->ids, true)));
 
-        self::assertSame([$queued->getId(), $pending->getId()], array_slice($listed, 0, 2), 'the oldest lost mails come first');
+        self::assertSame([$queued->getId(), $pending->getId()], array_slice($listed, 0, 2), 'the longest-untouched lost mails come first');
         self::assertSame([$queued->getId(), $pending->getId()], $lost, 'not the attempted, the null-driver, the sent or the recent one');
         self::assertNotContains($attempted->getId(), $lost);
         self::assertNotContains($sink->getId(), $lost);
         self::assertNotContains($sent->getId(), $lost);
         self::assertNotContains($recent->getId(), $lost);
+    }
+
+    /**
+     * The longest untouched first, not the oldest created. A claim touches the
+     * row, so a mail claimed and not published (its mailer cannot be resolved)
+     * goes to the back instead of holding a place at the head of every batch:
+     * ordered by created_at, more such rows than one batch holds kept every
+     * later lost mail out for good (review, semitexa-mail#29).
+     */
+    #[Test]
+    public function the_longest_untouched_come_first_so_a_claimed_mail_goes_to_the_back(): void
+    {
+        $claimedEarlier = $this->stored('queued', 'smtp', '1970-01-02 00:00:00', touched: '1970-01-02 03:00:00');
+        $older = $this->stored('queued', 'smtp', '1970-01-02 01:00:00');
+        $newer = $this->stored('queued', 'smtp', '1970-01-02 02:00:00');
+
+        $listed = array_map(static fn (MailMessage $m): string => $m->getId(), $this->repository->lostHandoffs(new \DateTimeImmutable('-15 minutes'), 500));
+        $ours = array_values(array_filter($listed, fn (string $id): bool => in_array($id, $this->ids, true)));
+
+        self::assertSame([$older->getId(), $newer->getId(), $claimedEarlier->getId()], $ours);
     }
 
     #[Test]
@@ -355,7 +375,7 @@ final class MailLostHandoffTest extends TestCase
         ));
     }
 
-    private function stored(string $status, string $driver, ?string $untouchedSince, int $attempts = 0): MailMessage
+    private function stored(string $status, string $driver, ?string $untouchedSince, int $attempts = 0, ?string $touched = null): MailMessage
     {
         $row = $this->repository->save(new MailMessage(
             id: '', tenantId: null, status: $status, driver: $driver, fromEmail: 'noreply@example.test', subject: 'Verify',
@@ -365,7 +385,7 @@ final class MailLostHandoffTest extends TestCase
         if ($untouchedSince !== null) {
             $this->orm->getAdapter()->execute(
                 'UPDATE mail_messages SET created_at = :c, updated_at = :u WHERE id = :id',
-                ['c' => $untouchedSince, 'u' => $untouchedSince, 'id' => Uuid7::toBytes($row->getId())],
+                ['c' => $untouchedSince, 'u' => $touched ?? $untouchedSince, 'id' => Uuid7::toBytes($row->getId())],
             );
         }
         for ($n = 1; $n <= $attempts; $n++) {
