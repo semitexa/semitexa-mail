@@ -202,6 +202,42 @@ final class MailLostHandoffTest extends TestCase
         self::assertSame('pending', $this->repository->findById($pending->getId())?->getStatus());
     }
 
+    /**
+     * semitexa-mail#29, thread 4686451205: the worker's recovery copy read the
+     * row and then claimed it with the ordinary claim, which takes a `failed`
+     * row. The recovery claim is one write that takes only an untried mail.
+     */
+    #[Test]
+    public function the_recovery_claim_takes_an_untried_mail_once_and_never_one_that_ended_after_it_was_read(): void
+    {
+        $queued = $this->stored('queued', 'smtp', self::LONG_AGO);
+        $pending = $this->stored('pending', 'smtp', self::LONG_AGO);
+        $failedMeanwhile = $this->stored('queued', 'smtp', self::LONG_AGO);
+        $deferredMeanwhile = $this->stored('queued', 'smtp', self::LONG_AGO);
+        $attempted = $this->stored('queued', 'smtp', self::LONG_AGO, attempts: 1);
+        // Read as `queued` above; its first message's worker ended it since.
+        foreach ([[$failedMeanwhile, 'failed'], [$deferredMeanwhile, 'deferred']] as [$row, $status]) {
+            $this->orm->getAdapter()->execute('UPDATE mail_messages SET status = :s WHERE id = :id', ['s' => $status, 'id' => Uuid7::toBytes($row->getId())]);
+        }
+
+        self::assertTrue($this->repository->claimRecoveryForSending($queued));
+        self::assertFalse($this->repository->claimRecoveryForSending($queued), 'a second caller finds it taken');
+        self::assertTrue($this->repository->claimRecoveryForSending($pending));
+        self::assertFalse($this->repository->claimRecoveryForSending($failedMeanwhile));
+        self::assertFalse($this->repository->claimRecoveryForSending($deferredMeanwhile));
+        self::assertFalse($this->repository->claimRecoveryForSending($attempted), 'tried once already: a resend or a retry owns it');
+
+        $after = array_map(
+            fn (MailMessage $m): ?string => $this->repository->findById($m->getId())?->getStatus(),
+            [$queued, $pending, $failedMeanwhile, $deferredMeanwhile, $attempted],
+        );
+        self::assertSame(['sending', 'sending', 'failed', 'deferred', 'queued'], $after);
+        $claimed = $this->repository->findById($queued->getId());
+        self::assertEqualsWithDelta(time(), $claimed?->getLastAttemptAt()?->getTimestamp(), 5, 'as the sending claim marks it');
+        self::assertEqualsWithDelta(time(), $claimed?->getUpdatedAt()?->getTimestamp(), 5);
+        self::assertNull($this->repository->findById($failedMeanwhile->getId())?->getLastAttemptAt(), 'a refused claim writes nothing');
+    }
+
     /** A worker whose sweep sees only this test's rows: the shared database's other lost mails are not touched. */
     private function worker(): MailWorker
     {

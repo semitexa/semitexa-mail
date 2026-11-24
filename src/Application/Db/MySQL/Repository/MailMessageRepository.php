@@ -10,6 +10,7 @@ use Semitexa\Mail\Application\Db\MySQL\Model\MailMessageResource;
 use Semitexa\Mail\Domain\Model\MailMessage;
 use Semitexa\Mail\Domain\Contract\MailRepositoryInterface;
 use Semitexa\Mail\Domain\Contract\MailHandoffRecoveryInterface;
+use Semitexa\Mail\Domain\Contract\MailRecoveryClaimInterface;
 use Semitexa\Mail\Domain\Contract\MailRecoveryInterface;
 use Semitexa\Mail\Domain\Contract\MailSendingClaimInterface;
 use Semitexa\Mail\Domain\Contract\MailOutcomeGuardInterface;
@@ -23,7 +24,7 @@ use Semitexa\Orm\Query\SystemScopeToken;
 use Semitexa\Orm\Repository\DomainRepository;
 
 #[SatisfiesRepositoryContract(of: MailRepositoryInterface::class)]
-class MailMessageRepository implements MailRepositoryInterface, MailRetentionInterface, MailRecoveryInterface, MailSendingClaimInterface, MailOutcomeGuardInterface, MailResendClaimInterface, MailHandoffRecoveryInterface
+class MailMessageRepository implements MailRepositoryInterface, MailRetentionInterface, MailRecoveryInterface, MailSendingClaimInterface, MailOutcomeGuardInterface, MailResendClaimInterface, MailHandoffRecoveryInterface, MailRecoveryClaimInterface
 {
     #[InjectAsReadonly]
     protected OrmManager $orm;
@@ -176,6 +177,24 @@ class MailMessageRepository implements MailRepositoryInterface, MailRetentionInt
                 'now_attempt' => $now,
                 'now' => $now,
                 'stale' => $staleBefore->setTimezone($utc)->format('Y-m-d H:i:s'),
+                'id' => Uuid7::toBytes($message->getId()),
+            ],
+        )->rowCount === 1;
+    }
+
+    public function claimRecoveryForSending(MailMessage $message): bool
+    {
+        $now = (new \DateTimeImmutable('now', new \DateTimeZone('UTC')))->format('Y-m-d H:i:s');
+
+        // One write: read first, a mail its first message failed in between
+        // (perhaps after the server took it) was claimed and sent again.
+        return $this->orm()->getQueryAdapter()->execute(
+            "UPDATE mail_messages SET status = 'sending', last_attempt_at = :now_attempt, updated_at = :now
+             WHERE id = :id AND status IN ('queued', 'pending')
+               AND NOT EXISTS (SELECT 1 FROM mail_attempts a WHERE a.mail_message_id = mail_messages.id)",
+            [
+                'now_attempt' => $now,
+                'now' => $now,
                 'id' => Uuid7::toBytes($message->getId()),
             ],
         )->rowCount === 1;
