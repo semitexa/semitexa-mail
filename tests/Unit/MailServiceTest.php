@@ -929,6 +929,185 @@ final class MailServiceTest extends TestCase
         self::assertSame('sent', $this->messages->byId($id)?->getStatus());
     }
 
+    /** @return iterable<string, array{string, ?string, int, string}> */
+    public static function recoveryCopies(): iterable
+    {
+        // [the row's status when the copy is read, its error code, deliveries, the status after]
+        yield 'failed, perhaps after the server took it' => ['failed', 'unknown_transport_error', 0, 'failed'];
+        yield 'deferred, its own retry on the way' => ['deferred', 'timeout', 0, 'deferred'];
+        yield 'sent' => ['sent', null, 0, 'sent'];
+        yield 'enqueue_failed, said to its sender' => ['enqueue_failed', 'queue_unavailable', 0, 'enqueue_failed'];
+        yield 'still queued: the first message was lost' => ['queued', null, 1, 'sent'];
+        yield 'still pending' => ['pending', null, 1, 'sent'];
+    }
+
+    /**
+     * tk-mail-lost-handoff-no-recovery: the sweep cannot tell a lost publish
+     * from one still waiting in the broker. Its copy, read after the first
+     * message was, delivered a failed mail again and retried a deferred one
+     * beside its own retry.
+     */
+    #[Test]
+    #[\PHPUnit\Framework\Attributes\DataProvider('recoveryCopies')]
+    public function a_recovery_copy_delivers_only_a_mail_still_untried(string $status, ?string $errorCode, int $deliveries, string $after): void
+    {
+        $this->spyOnTheQueue();
+        $id = $this->queuedMessage();
+        $this->messages->save(($this->messages->byId($id) ?? self::fail('not stored'))->with(['status' => $status, 'errorCode' => $errorCode]));
+
+        $this->worker()->processPayload((new QueuedMailMessage(messageId: $id, recoveryOnly: true))->toJson());
+
+        self::assertSame($deliveries, $this->fake->count());
+        self::assertSame($after, $this->messages->byId($id)?->getStatus());
+        self::assertSame($errorCode, $this->messages->byId($id)?->getErrorCode());
+        self::assertSame([], MailServiceQueueSpy::$published, 'no retry of its own');
+        self::assertSame(0, $this->messages->sendingClaims, 'never through the ordinary claim, which takes a failed or deferred row');
+        self::assertSame($status === 'sent' ? 0 : 1, $this->messages->recoveryClaims, 'one conditional write decides');
+    }
+
+    /**
+     * semitexa-mail#29, thread 4686451205: the copy read `queued`, the first
+     * message's worker then ended the mail `failed` after the server may have
+     * taken it, and the ordinary claim (anything not sent, not being sent)
+     * took the failed row: sent again. The recovery claim is one write, and
+     * refused, the copy is done.
+     */
+    #[Test]
+    public function a_recovery_copy_does_not_take_a_mail_that_failed_after_it_was_read(): void
+    {
+        $this->spyOnTheQueue();
+        $id = $this->queuedMessage();
+        $this->messages->beforeClaim = static function (MailServiceMessages $messages) use ($id): void {
+            $messages->save(($messages->byId($id) ?? self::fail('not stored'))->with(['status' => 'failed', 'errorCode' => 'unknown_transport_error']));
+        };
+
+        $this->worker()->processPayload((new QueuedMailMessage(messageId: $id, recoveryOnly: true))->toJson());
+
+        self::assertSame(0, $this->fake->count());
+        self::assertSame(['failed', 'unknown_transport_error'], [$this->messages->byId($id)?->getStatus(), $this->messages->byId($id)?->getErrorCode()]);
+        self::assertSame([1, 0], [$this->messages->recoveryClaims, $this->messages->sendingClaims]);
+        self::assertSame([], MailServiceQueueSpy::$published);
+    }
+
+    /** @return iterable<string, array{bool}> */
+    public static function whenAnotherWorkerTookIt(): iterable
+    {
+        yield 'before the copy was read' => [false];
+        yield 'between the read and the claim' => [true];
+    }
+
+    /**
+     * semitexa-mail#29, round 3: a recovery copy that met a worker on the
+     * mail went the ordinary way (a takeover copy, a throw back to the queue,
+     * a delivery beside that worker), and each way had its own window. It
+     * does nothing now: that worker owns the send, and if it dies the next
+     * sweep finds the row.
+     */
+    #[Test]
+    #[\PHPUnit\Framework\Attributes\DataProvider('whenAnotherWorkerTookIt')]
+    public function a_recovery_copy_that_meets_a_live_worker_on_the_mail_does_nothing(bool $afterTheRead): void
+    {
+        QueueTransportRegistry::register('mail-test-delayed', new class implements \Semitexa\Core\Queue\QueueTransportFactoryInterface {
+            public function create(): \Semitexa\Core\Queue\QueueTransportInterface
+            {
+                return new MailServiceDelayedQueueSpy();
+            }
+        });
+        $this->spyOnTheQueue();
+        $id = $this->queuedMessage();
+        $taken = static function (MailServiceMessages $messages) use ($id): void {
+            $messages->save(($messages->byId($id) ?? self::fail('not stored'))->with(['status' => 'sending']));
+            $messages->heldByAnotherWorker[$id] = true;
+        };
+        $afterTheRead ? $this->messages->beforeClaim = $taken : $taken($this->messages);
+
+        // verify:accept-test-change round 3 of semitexa-mail#29 replaces a_recovery_copy_that_meets_a_worker_on_the_mail_is_looked_at_again_like_a_redelivery, a_recovery_copy_never_delivers_beside_a_live_worker_when_no_takeover_can_be_scheduled and on_the_in_memory_queue_such_a_recovery_copy_is_dropped_and_said: a recovery copy schedules no takeover and throws nothing any more, it only claims or stops; this test pins that for the same rows
+        // Where a takeover copy would be held back, and then where it could not be.
+        foreach (['mail-test-delayed', 'mail-test-spy'] as $transport) {
+            putenv('EVENTS_TRANSPORT=' . $transport);
+            $this->worker()->processPayload((new QueuedMailMessage(messageId: $id, recoveryOnly: true))->toJson());
+        }
+
+        self::assertSame(0, $this->fake->count(), 'not sent beside the other worker');
+        self::assertSame('sending', $this->messages->byId($id)?->getStatus());
+        self::assertSame([], MailServiceDelayedQueueSpy::$delayed, 'no takeover copy');
+        self::assertSame([], MailServiceQueueSpy::$published);
+        self::assertSame([], $this->attempts->saved);
+        self::assertSame([2, 0], [$this->messages->recoveryClaims, $this->messages->sendingClaims]);
+    }
+
+    /** Not changed by the recovery copy's rule: an ordinary redelivery is delivered rather than lost. */
+    #[Test]
+    public function an_ordinary_redelivery_that_cannot_be_held_back_is_still_delivered(): void
+    {
+        $this->spyOnTheQueue();
+        $id = $this->queuedMessage();
+        $this->messages->save(($this->messages->byId($id) ?? self::fail('not stored'))->with(['status' => 'sending']));
+        $this->messages->heldByAnotherWorker[$id] = true;
+
+        $this->worker()->processPayload((new QueuedMailMessage(messageId: $id))->toJson());
+
+        self::assertSame(1, $this->fake->count());
+        self::assertSame('sent', $this->messages->byId($id)?->getStatus());
+    }
+
+    #[Test]
+    public function a_recovery_copy_takes_over_a_mail_its_dead_worker_left_sending_once(): void
+    {
+        $this->spyOnTheQueue();
+        $id = $this->queuedMessage();
+        // verify:accept-test-change renamed from a_redelivered_recovery_copy_takes_over_a_mail_its_dead_worker_left_sending: the same row and outcome, now through the recovery claim, and a second copy added
+        // Abandoned: `sending`, and no live worker holds it.
+        $this->messages->save(($this->messages->byId($id) ?? self::fail('not stored'))->with(['status' => 'sending']));
+        $copy = (new QueuedMailMessage(messageId: $id, recoveryOnly: true))->toJson();
+
+        $this->worker()->processPayload($copy);
+        $this->worker()->processPayload($copy);
+
+        self::assertSame(1, $this->fake->count());
+        self::assertSame('sent', $this->messages->byId($id)?->getStatus());
+        self::assertSame([1, 0], [$this->messages->recoveryClaims, $this->messages->sendingClaims], 'by the recovery claim; the second copy stopped at `sent`');
+    }
+
+    #[Test]
+    public function the_first_send_publishes_no_recovery_copy_and_an_older_message_is_not_one(): void
+    {
+        $this->spyOnTheQueue();
+        $id = (string) $this->service()->send($this->envelope(subject: 'Once', text: 'x'), new MailSendOptions(mode: MailSendMode::Queued))->messageId;
+
+        self::assertCount(1, MailServiceQueueSpy::$published);
+        $first = json_decode(MailServiceQueueSpy::$published[0][1], true, 512, JSON_THROW_ON_ERROR);
+        self::assertIsArray($first);
+        unset($first['queuedAt']);
+        self::assertSame(
+            ['type' => 'mail', 'messageId' => $id, 'attempts' => 0, 'maxRetries' => 3, 'retryDelay' => 60, 'takeoverOnly' => false, 'recoveryOnly' => false],
+            $first,
+        );
+        // Published before the field existed: read as an ordinary message.
+        self::assertFalse(QueuedMailMessage::fromJson('{"type":"mail","messageId":"m-1","takeoverOnly":false}')->recoveryOnly);
+        self::assertTrue(QueuedMailMessage::fromJson('{"type":"mail","messageId":"m-1","recoveryOnly":true}')->recoveryOnly);
+    }
+
+    #[Test]
+    public function a_retry_of_a_recovery_copy_is_an_ordinary_message(): void
+    {
+        $this->spyOnTheQueue();
+        $id = $this->queuedMessage();
+        MailTransportRegistry::register(new MailServiceScriptedTransport(new MailTransportResult(status: MailTransportStatus::Failed, errorCode: 'timeout', errorMessage: 'SMTP timed out')));
+
+        $this->worker(driver: 'scripted')->processPayload((new QueuedMailMessage(messageId: $id, maxRetries: 2, retryDelay: 0, recoveryOnly: true))->toJson());
+
+        self::assertSame('deferred', $this->messages->byId($id)?->getStatus());
+        self::assertCount(1, MailServiceQueueSpy::$published);
+        $retry = QueuedMailMessage::fromJson(MailServiceQueueSpy::$published[0][1]);
+        self::assertFalse($retry->recoveryOnly, 'still marked, it met the deferred row and was skipped');
+
+        $this->worker()->processPayload($retry->toJson());
+
+        self::assertSame(1, $this->fake->count());
+        self::assertSame('sent', $this->messages->byId($id)?->getStatus());
+    }
+
     /** A partial refusal's warning named every refused address and the server's reply in the log. */
     #[Test]
     public function a_partial_refusal_is_logged_as_a_count_not_the_addresses(): void
@@ -1059,8 +1238,40 @@ final class MailServiceRenderer implements MailTemplateRendererInterface
     }
 }
 
-final class MailServiceMessages implements MailRepositoryInterface, MailRecoveryInterface, \Semitexa\Mail\Domain\Contract\MailSendingClaimInterface, \Semitexa\Mail\Domain\Contract\MailOutcomeGuardInterface, \Semitexa\Mail\Domain\Contract\MailResendClaimInterface
+final class MailServiceMessages implements MailRepositoryInterface, MailRecoveryInterface, \Semitexa\Mail\Domain\Contract\MailSendingClaimInterface, \Semitexa\Mail\Domain\Contract\MailOutcomeGuardInterface, \Semitexa\Mail\Domain\Contract\MailResendClaimInterface, \Semitexa\Mail\Domain\Contract\MailRecoveryClaimInterface
 {
+    /** Called once, just before the next sending claim of either kind: what another worker did since the row was read. */
+    public ?\Closure $beforeClaim = null;
+
+    /** How many times the recovery claim was asked. */
+    public int $recoveryClaims = 0;
+
+    private function sinceTheRead(): void
+    {
+        if ($this->beforeClaim !== null) {
+            [$meanwhile, $this->beforeClaim] = [$this->beforeClaim, null];
+            $meanwhile($this);
+        }
+    }
+
+    /** How many times the ordinary sending claim was asked. */
+    public int $sendingClaims = 0;
+
+    public function claimRecoveryForSending(MailMessage $message, \DateTimeImmutable $abandonedBefore): bool
+    {
+        $this->recoveryClaims++;
+        $this->sinceTheRead();
+        $stored = $this->byId[$message->getId()] ?? null;
+        // A `sending` row no live worker holds is one left longer ago than $abandonedBefore.
+        $abandoned = $stored?->getStatus() === 'sending' && !isset($this->heldByAnotherWorker[$message->getId()]);
+        if ($stored === null || !(in_array($stored->getStatus(), ['queued', 'pending'], true) || $abandoned)) {
+            return false;
+        }
+        $this->byId[$message->getId()] = $stored->with(['status' => 'sending']);
+
+        return true;
+    }
+
     /** @var array<string, MailMessage> */
     private array $byId = [];
 
@@ -1069,6 +1280,8 @@ final class MailServiceMessages implements MailRepositoryInterface, MailRecovery
 
     public function claimForSending(MailMessage $message, \DateTimeImmutable $staleBefore): bool
     {
+        $this->sendingClaims++;
+        $this->sinceTheRead();
         $stored = $this->byId[$message->getId()] ?? null;
         if ($stored === null || $stored->getStatus() === 'sent' || isset($this->heldByAnotherWorker[$message->getId()])) {
             return false;

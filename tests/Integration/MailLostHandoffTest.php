@@ -6,10 +6,20 @@ namespace Semitexa\Mail\Tests\Integration;
 
 use PHPUnit\Framework\Attributes\Test;
 use PHPUnit\Framework\TestCase;
+use Semitexa\Core\Queue\QueueTransportFactoryInterface;
+use Semitexa\Core\Queue\QueueTransportInterface;
+use Semitexa\Core\Queue\QueueTransportRegistry;
 use Semitexa\Mail\Application\Db\MySQL\Repository\MailMessageRepository;
+use Semitexa\Mail\Application\Service\AttachmentResolver;
+use Semitexa\Mail\Application\Service\MailWorker;
+use Semitexa\Mail\Domain\Contract\MailAttemptRepositoryInterface;
+use Semitexa\Mail\Domain\Contract\MailerConfigResolverInterface;
+use Semitexa\Mail\Domain\Contract\MailHandoffRecoveryInterface;
+use Semitexa\Mail\Domain\Model\MailerConfig;
 use Semitexa\Mail\Domain\Model\MailMessage;
 use Semitexa\Orm\Application\Service\Uuid7;
 use Semitexa\Orm\OrmManager;
+use Symfony\Component\Console\Output\NullOutput;
 
 /**
  * orm-gap-7-package-read-apis: a mail the queue accepted and then lost sits
@@ -61,7 +71,7 @@ final class MailLostHandoffTest extends TestCase
         $ours = array_map(static fn (string $id): string => Uuid7::toBytes($id), $this->ids);
         $placeholders = implode(', ', array_map(static fn (int $i): string => ':o' . $i, array_keys($ours)));
         $older = $this->orm->getAdapter()->execute(
-            "SELECT COUNT(*) AS c FROM mail_messages WHERE created_at <= '1970-01-03 00:00:00' AND id NOT IN ({$placeholders})",
+            "SELECT COUNT(*) AS c FROM mail_messages WHERE updated_at <= '1970-01-03 00:00:00' AND id NOT IN ({$placeholders})",
             array_combine(array_map(static fn (int $i): string => 'o' . $i, array_keys($ours)), $ours),
         )->rows[0]['c'] ?? null;
         self::assertNotNull($older, 'the count came back');
@@ -70,12 +80,32 @@ final class MailLostHandoffTest extends TestCase
         $listed = array_map(static fn (MailMessage $m): string => $m->getId(), $this->repository->lostHandoffs(new \DateTimeImmutable('-15 minutes'), 500));
         $lost = array_values(array_filter($listed, fn (string $id): bool => in_array($id, $this->ids, true)));
 
-        self::assertSame([$queued->getId(), $pending->getId()], array_slice($listed, 0, 2), 'the oldest lost mails come first');
+        self::assertSame([$queued->getId(), $pending->getId()], array_slice($listed, 0, 2), 'the longest-untouched lost mails come first');
         self::assertSame([$queued->getId(), $pending->getId()], $lost, 'not the attempted, the null-driver, the sent or the recent one');
         self::assertNotContains($attempted->getId(), $lost);
         self::assertNotContains($sink->getId(), $lost);
         self::assertNotContains($sent->getId(), $lost);
         self::assertNotContains($recent->getId(), $lost);
+    }
+
+    /**
+     * The longest untouched first, not the oldest created. A claim touches the
+     * row, so a mail claimed and not published (its mailer cannot be resolved)
+     * goes to the back instead of holding a place at the head of every batch:
+     * ordered by created_at, more such rows than one batch holds kept every
+     * later lost mail out for good (review, semitexa-mail#29).
+     */
+    #[Test]
+    public function the_longest_untouched_come_first_so_a_claimed_mail_goes_to_the_back(): void
+    {
+        $claimedEarlier = $this->stored('queued', 'smtp', '1970-01-02 00:00:00', touched: '1970-01-02 03:00:00');
+        $older = $this->stored('queued', 'smtp', '1970-01-02 01:00:00');
+        $newer = $this->stored('queued', 'smtp', '1970-01-02 02:00:00');
+
+        $listed = array_map(static fn (MailMessage $m): string => $m->getId(), $this->repository->lostHandoffs(new \DateTimeImmutable('-15 minutes'), 500));
+        $ours = array_values(array_filter($listed, fn (string $id): bool => in_array($id, $this->ids, true)));
+
+        self::assertSame([$older->getId(), $newer->getId(), $claimedEarlier->getId()], $ours);
     }
 
     #[Test]
@@ -128,6 +158,210 @@ final class MailLostHandoffTest extends TestCase
     }
 
     /**
+     * tk-mail-lost-handoff-no-recovery: nothing called the two methods above.
+     * mail:work's sweep does, and a second worker sweeping right after the
+     * first publishes nothing: the claim touched the row.
+     */
+    #[Test]
+    public function the_worker_publishes_a_lost_mail_once_however_many_workers_sweep(): void
+    {
+        $lost = $this->stored('queued', 'smtp', self::LONG_AGO);
+        $pending = $this->stored('pending', 'smtp', '1970-01-03 00:00:00');
+        $crashed = $this->stored('sending', 'smtp', '1970-01-04 00:00:00');
+        $this->stored('queued', 'smtp', self::LONG_AGO, attempts: 1);
+        $this->stored('queued', 'null', self::LONG_AGO);
+        $this->stored('queued', 'smtp', null);
+        $this->stored('sending', 'smtp', null);
+
+        $queue = new class implements QueueTransportInterface {
+            /** @var list<array{string, mixed}> queue and decoded message */
+            public array $published = [];
+
+            public function publish(string $queueName, string $payload): void
+            {
+                $this->published[] = [$queueName, json_decode($payload, true)];
+            }
+
+            public function consume(string $queueName, callable $callback): void
+            {
+            }
+        };
+        $eventsTransport = getenv('EVENTS_TRANSPORT');
+        $handoffMinutes = getenv('MAIL_LOST_HANDOFF_MINUTES');
+        $registry = [];
+        foreach ((new \ReflectionClass(QueueTransportRegistry::class))->getProperties(\ReflectionProperty::IS_STATIC) as $property) {
+            $registry[$property->getName()] = $property->getValue();
+        }
+        QueueTransportRegistry::register('mail-lost-handoff-test', new class($queue) implements QueueTransportFactoryInterface {
+            public function __construct(private readonly QueueTransportInterface $queue)
+            {
+            }
+
+            public function create(): QueueTransportInterface
+            {
+                return $this->queue;
+            }
+        });
+        putenv('EVENTS_TRANSPORT=mail-lost-handoff-test');
+        putenv('MAIL_LOST_HANDOFF_MINUTES');
+        try {
+            $this->worker()->processPayload('{"type":"other"}');
+            $this->worker()->processPayload('{"type":"other"}');
+        } finally {
+            putenv($eventsTransport === false ? 'EVENTS_TRANSPORT' : 'EVENTS_TRANSPORT=' . $eventsTransport);
+            putenv($handoffMinutes === false ? 'MAIL_LOST_HANDOFF_MINUTES' : 'MAIL_LOST_HANDOFF_MINUTES=' . $handoffMinutes);
+            foreach ($registry as $name => $value) {
+                (new \ReflectionProperty(QueueTransportRegistry::class, $name))->setValue(null, $value);
+            }
+        }
+
+        self::assertSame(
+            [['mail-handoff', $lost->getId(), 0, true], ['mail-handoff', $pending->getId(), 0, true], ['mail-handoff', $crashed->getId(), 0, true]],
+            array_map(static fn (array $p): array => [$p[0], $p[1]['messageId'] ?? null, $p[1]['attempts'] ?? null, $p[1]['recoveryOnly'] ?? null], $queue->published),
+            'each lost mail once, the one its dead worker left `sending` too; not the attempted, the null-driver, the recent or the freshly taken one',
+        );
+        self::assertSame('queued', $this->repository->findById($lost->getId())?->getStatus());
+        self::assertSame('pending', $this->repository->findById($pending->getId())?->getStatus());
+        self::assertSame('queued', $this->repository->findById($crashed->getId())?->getStatus(), 'waiting again for the copy just published');
+    }
+
+    /**
+     * semitexa-mail#29, thread 4686451205: the worker's recovery copy read the
+     * row and then claimed it with the ordinary claim, which takes a `failed`
+     * row. The recovery claim is one write that takes only an untried mail.
+     */
+    #[Test]
+    public function the_recovery_claim_takes_an_untried_mail_once_and_never_one_that_ended_after_it_was_read(): void
+    {
+        $queued = $this->stored('queued', 'smtp', self::LONG_AGO);
+        $pending = $this->stored('pending', 'smtp', self::LONG_AGO);
+        $failedMeanwhile = $this->stored('queued', 'smtp', self::LONG_AGO);
+        $deferredMeanwhile = $this->stored('queued', 'smtp', self::LONG_AGO);
+        $attempted = $this->stored('queued', 'smtp', self::LONG_AGO, attempts: 1);
+        // Read as `queued` above; its first message's worker ended it since.
+        foreach ([[$failedMeanwhile, 'failed'], [$deferredMeanwhile, 'deferred']] as [$row, $status]) {
+            $this->orm->getAdapter()->execute('UPDATE mail_messages SET status = :s WHERE id = :id', ['s' => $status, 'id' => Uuid7::toBytes($row->getId())]);
+        }
+
+        $window = new \DateTimeImmutable('-900 seconds');
+        self::assertTrue($this->repository->claimRecoveryForSending($queued, $window));
+        self::assertFalse($this->repository->claimRecoveryForSending($queued, $window), 'a second caller finds it taken: `sending`, and fresh');
+        self::assertTrue($this->repository->claimRecoveryForSending($pending, $window));
+        self::assertFalse($this->repository->claimRecoveryForSending($failedMeanwhile, $window));
+        self::assertFalse($this->repository->claimRecoveryForSending($deferredMeanwhile, $window));
+        self::assertFalse($this->repository->claimRecoveryForSending($attempted, $window), 'tried once already: a resend or a retry owns it');
+
+        $after = array_map(
+            fn (MailMessage $m): ?string => $this->repository->findById($m->getId())?->getStatus(),
+            [$queued, $pending, $failedMeanwhile, $deferredMeanwhile, $attempted],
+        );
+        self::assertSame(['sending', 'sending', 'failed', 'deferred', 'queued'], $after);
+        $claimed = $this->repository->findById($queued->getId());
+        self::assertEqualsWithDelta(time(), $claimed?->getLastAttemptAt()?->getTimestamp(), 5, 'as the sending claim marks it');
+        self::assertEqualsWithDelta(time(), $claimed?->getUpdatedAt()?->getTimestamp(), 5);
+        self::assertNull($this->repository->findById($failedMeanwhile->getId())?->getLastAttemptAt(), 'a refused claim writes nothing');
+    }
+
+    /**
+     * semitexa-mail#29, thread 4686451216: when the publish was lost the
+     * recovery copy is the only message, and the worker that took it can die
+     * holding the row `sending`. One write takes such a row once it is older
+     * than the takeover window, and never a fresh one: a live worker's.
+     */
+    #[Test]
+    public function the_recovery_claim_takes_over_an_untried_sending_row_only_once_its_worker_is_presumed_dead(): void
+    {
+        $utc = new \DateTimeZone('UTC');
+        $abandoned = $this->stored('sending', 'smtp', (new \DateTimeImmutable('-901 seconds', $utc))->format('Y-m-d H:i:s'));
+        $fresh = $this->stored('sending', 'smtp', (new \DateTimeImmutable('-890 seconds', $utc))->format('Y-m-d H:i:s'));
+        $attempted = $this->stored('sending', 'smtp', self::LONG_AGO, attempts: 1);
+        $window = new \DateTimeImmutable('-900 seconds', new \DateTimeZone('America/New_York'));
+
+        self::assertTrue($this->repository->claimRecoveryForSending($abandoned, $window));
+        self::assertFalse($this->repository->claimRecoveryForSending($abandoned, $window), 'claimed now: fresh for the second caller');
+        self::assertFalse($this->repository->claimRecoveryForSending($fresh, $window));
+        self::assertFalse($this->repository->claimRecoveryForSending($attempted, $window), 'tried: the ordinary takeover owns it');
+
+        $claimed = $this->repository->findById($abandoned->getId());
+        self::assertSame('sending', $claimed?->getStatus());
+        self::assertEqualsWithDelta(time(), $claimed?->getUpdatedAt()?->getTimestamp(), 5);
+        self::assertEqualsWithDelta(time(), $claimed?->getLastAttemptAt()?->getTimestamp(), 5);
+        self::assertEqualsWithDelta(time() - 890, $this->repository->findById($fresh->getId())?->getUpdatedAt()?->getTimestamp(), 5, 'a refused claim writes nothing');
+    }
+
+    /**
+     * And the sweep finds it: with no message left on the queue, nothing else
+     * would. Listed once past the takeover window, whatever shorter window the
+     * sweep asks for, and put back to `queued` by the claim so the message
+     * published next finds a mail waiting.
+     */
+    #[Test]
+    public function an_untried_sending_row_is_lost_once_its_worker_is_presumed_dead_and_the_claim_requeues_it(): void
+    {
+        $utc = new \DateTimeZone('UTC');
+        $abandoned = $this->stored('sending', 'smtp', (new \DateTimeImmutable('-901 seconds', $utc))->format('Y-m-d H:i:s'));
+        $fresh = $this->stored('sending', 'smtp', (new \DateTimeImmutable('-890 seconds', $utc))->format('Y-m-d H:i:s'));
+        $attempted = $this->stored('sending', 'smtp', self::LONG_AGO, attempts: 1);
+        $sink = $this->stored('sending', 'null', self::LONG_AGO);
+        // A sweep with a 5-minute window: a `sending` row still waits out the takeover window.
+        $cutoff = new \DateTimeImmutable('-5 minutes');
+
+        self::assertSame([$abandoned->getId()], $this->ours($this->repository->lostHandoffs($cutoff, 500)));
+        self::assertFalse($this->repository->claimLostHandoff($fresh, $cutoff));
+        self::assertFalse($this->repository->claimLostHandoff($attempted, $cutoff));
+        self::assertFalse($this->repository->claimLostHandoff($sink, $cutoff));
+        self::assertTrue($this->repository->claimLostHandoff($abandoned, $cutoff));
+        self::assertFalse($this->repository->claimLostHandoff($abandoned, $cutoff), 'a second sweep finds it taken');
+
+        self::assertSame(
+            ['queued', 'sending', 'sending', 'sending'],
+            array_map(fn (MailMessage $m): ?string => $this->repository->findById($m->getId())?->getStatus(), [$abandoned, $fresh, $attempted, $sink]),
+        );
+        self::assertSame([], $this->ours($this->repository->lostHandoffs($cutoff, 500)), 'left for a window');
+        self::assertTrue($this->repository->claimRecoveryForSending($abandoned, new \DateTimeImmutable('-900 seconds')), 'the copy published next takes it');
+    }
+
+    /** A worker whose sweep sees only this test's rows: the shared database's other lost mails are not touched. */
+    private function worker(): MailWorker
+    {
+        $ours = new class($this->repository, fn (array $messages): array => array_values(array_filter(
+            $messages,
+            fn (MailMessage $m): bool => in_array($m->getId(), $this->ids, true),
+        ))) implements MailHandoffRecoveryInterface {
+            public function __construct(private readonly MailMessageRepository $repository, private readonly \Closure $ours)
+            {
+            }
+
+            public function lostHandoffs(\DateTimeImmutable $untouchedSince, int $limit): array
+            {
+                return ($this->ours)($this->repository->lostHandoffs($untouchedSince, $limit));
+            }
+
+            public function claimLostHandoff(MailMessage $message, \DateTimeImmutable $untouchedSince): bool
+            {
+                return $this->repository->claimLostHandoff($message, $untouchedSince);
+            }
+        };
+        $config = new class implements MailerConfigResolverInterface {
+            public function resolve(?string $tenantId = null, ?string $mailerKey = null): MailerConfig
+            {
+                return new MailerConfig(queue: 'mail-handoff');
+            }
+        };
+        $worker = new MailWorker(
+            $this->repository,
+            self::createStub(MailAttemptRepositoryInterface::class),
+            $config,
+            (new \ReflectionClass(AttachmentResolver::class))->newInstanceWithoutConstructor(),
+            null,
+            $ours,
+        );
+        $worker->setOutput(new NullOutput());
+
+        return $worker;
+    }
+
+    /**
      * The shared test database may hold other rows: keep this test's, in the order given.
      *
      * @param list<MailMessage> $messages
@@ -141,7 +375,7 @@ final class MailLostHandoffTest extends TestCase
         ));
     }
 
-    private function stored(string $status, string $driver, ?string $untouchedSince, int $attempts = 0): MailMessage
+    private function stored(string $status, string $driver, ?string $untouchedSince, int $attempts = 0, ?string $touched = null): MailMessage
     {
         $row = $this->repository->save(new MailMessage(
             id: '', tenantId: null, status: $status, driver: $driver, fromEmail: 'noreply@example.test', subject: 'Verify',
@@ -151,7 +385,7 @@ final class MailLostHandoffTest extends TestCase
         if ($untouchedSince !== null) {
             $this->orm->getAdapter()->execute(
                 'UPDATE mail_messages SET created_at = :c, updated_at = :u WHERE id = :id',
-                ['c' => $untouchedSince, 'u' => $untouchedSince, 'id' => Uuid7::toBytes($row->getId())],
+                ['c' => $untouchedSince, 'u' => $touched ?? $untouchedSince, 'id' => Uuid7::toBytes($row->getId())],
             );
         }
         for ($n = 1; $n <= $attempts; $n++) {
